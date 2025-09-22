@@ -132,8 +132,8 @@ def process(input_path, output_path):
                     landmarks_data["landmarks"].append({
                         "id": coco_id,         # 存入 COCO ID (0-16)
                         "name": coco_name,       # 【新增】存入器官名稱
-                        "x": landmark.x,
-                        "y": landmark.y,
+                        "x": int(landmark.x * w),
+                        "y": int(landmark.y * h),
                         "z": landmark.z,
                         "v": landmark.visibility
                     })
@@ -309,3 +309,4 @@ def main():
     print("\n已完成所有待處理的輸入檔")
 
 main()
+
