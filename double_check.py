@@ -42,7 +42,7 @@ def working(video_path, base_dir):
         frame_count += 1
         
         # 先將就 3 幀畫一次
-        if frame_count % 3 == 0:
+        if frame_count % 1 == 0:
             json_filename = f"frame_{frame_count:012d}.json"
             json_path = os.path.join(json_folder, json_filename)
             
@@ -84,3 +84,4 @@ def main():
 
 
 main()
+
