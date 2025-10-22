@@ -4,7 +4,7 @@
 > clone 專案連結: https://github.com/johschmidt42/PyTorch-Object-Detection-Faster-RCNN-Tutorial
 > 一樣按照原作者說的流程安裝必要的套件或東西。
 * 要按照你們本機端修改的程式路徑有: model_weights_path, project_dir
-
+* 仔細看我上面附的，有一個檔案是甚麼 osnet..... 那個要下載並且放到相對路徑: PyTorch-Object-Detection-Faster-RCNN-Tutorial\weights\
   
 ### 2d_detection.py 我放在 "D:\rcnn\deep-high-resolution-net.pytorch\demo\2d_detection.py"
 > 2d_detection.py 那個是我目前用別的 2d 檢測模型去跑的，你們要先 clone 到本機端，網址是 https://github.com/leoxiaobin/deep-high-resolution-net.pytorch/tree/master
