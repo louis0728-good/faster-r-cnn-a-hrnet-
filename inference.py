@@ -258,7 +258,7 @@ def _inference_single_pose_model(model,
             0,  # need to be assigned if batch_size > 1
             'dataset':
             dataset_name,
-            'dataset_idx': cfg.data_cfg.get('dataset_idx', 0), # 改 
+            'dataset_idx': cfg.data_cfg.get('dataset_idx', 0), # 改，不加這個會錯 說 KeyError: 'dataset_idx' 
             'joints_3d':
             np.zeros((cfg.data_cfg.num_joints, 3), dtype=np.float32),
             'joints_3d_visible':
@@ -832,3 +832,4 @@ def process_mmdet_results(mmdet_results, cat_id=1):
         person_results.append(person)
 
     return person_results
+
