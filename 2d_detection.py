@@ -1,48 +1,25 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import argparse
-import csv
 import os
-import shutil
-
-from PIL import Image
 import torch
 import torch.nn.parallel
-import torch.backends.cudnn as cudnn
-import torch.optim
-import torch.utils.data
-import torch.utils.data.distributed
-import torchvision.transforms as transforms
-import torchvision
+import torch.backends.cudnn as cudnn  # 雖然沒用到，但留著也無妨
 import cv2
 import glob
 import json
 import numpy as np
-
 import sys
-#sys.path.append("../lib")
-import os.path as osp
-sys.path.insert(0, osp.join(osp.dirname(__file__), '..'))
-
-# 取得當前檔案的目錄，然後找到專案根目錄和 lib 目錄
-current_dir = osp.dirname(osp.abspath(__file__))  # demo/
-
-project_root = osp.dirname(current_dir)            # deep-high-resolution-net.pytorch/
-# 往上一層到專案根目錄
-lib_path = osp.join(project_root, 'lib')           # deep-high-resolution-net.pytorch/lib/
-# 找到 lib/
-sys.path.insert(0, project_root)
-sys.path.insert(0, lib_path)
-
 import time
+import warnings
 
-import models
-from config import cfg
-from config import update_config
-from core.inference import get_final_preds
-from utils.transforms import get_affine_transform
+# 新增 MMPose/ViTPose 相關的 import (我是參考 top_down_img_demo.py 把相關套件載下來)
+from xtcocotools.coco import COCO
+from mmpose.apis import (inference_top_down_pose_model, init_pose_model,
+                         vis_pose_result)
+#init_pose_model: 初始化模型（把模型架構和權重載入記憶體）。
+#inference_top_down_pose_model: 進行推論（真正算出關鍵點的核心函式）。
+#vis_pose_result: 視覺化（把骨架畫在圖片上）。
+
+from mmpose.datasets import DatasetInfo
 
 CTX = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 if torch.cuda.is_available():
@@ -82,36 +59,43 @@ COCO_SKELETON = [
     (12, 14), (14, 16)  # 右腿
 ]
 
-def get_pose_estimation_prediction(pose_model, image, centers, scales, transform):
-    rotation = 0
+def get_pose_estimation_prediction(pose_model, image, bboxes, dataset, dataset_info):
+    """
+    使用 ViTPose/MMPose 進行姿態估計
+    """
+    # 轉換 bbox 格式
+    person_results = []
+    for bbox in bboxes: # box = [(x1, y1), (x2, y2)]
+        x1, y1 = bbox[0]
+        x2, y2 = bbox[1]
+        person_results.append({
+            'bbox': [x1, y1, x2-x1, y2-y1]  # [x,y,w,h]
+        })
+    
+    # 使用 MMPose API
+    pose_results, _ = inference_top_down_pose_model(
+        pose_model,
+        image, # 圖片路徑
+        person_results, # 剛才打包好的 BBox 列表
+        bbox_thr=None,
+        format='xywh', # 強調 BBox 格式是 xywh
+        dataset=dataset, # 資料集類型
+        dataset_info=dataset_info, # 資料集詳細定義
+        return_heatmap=False,
+        outputs=None
+    )
+    
+    # 解析結果
+    coords = []
+    confidence = []
+    for result in pose_results:
+        keypoints = result['keypoints']
+        coords.append(keypoints[:, :2]) # 取前 2 行 (columns 0 和 1，也就是 x, y)
+                            # 取所有列 (所有 17 個關鍵點)
+        confidence.append(keypoints[:, 2:3]) # 取 confidence score
+    
+    return np.array(coords), np.array(confidence)
 
-    # pose estimation transformation
-    model_inputs = []
-    for center, scale in zip(centers, scales):
-        trans = get_affine_transform(center, scale, rotation, cfg.MODEL.IMAGE_SIZE)
-        # Crop smaller image of people
-        model_input = cv2.warpAffine(
-            image,
-            trans,
-            (int(cfg.MODEL.IMAGE_SIZE[0]), int(cfg.MODEL.IMAGE_SIZE[1])),
-            flags=cv2.INTER_LINEAR)
-
-        # hwc -> 1chw
-        model_input = transform(model_input)#.unsqueeze(0)
-        model_inputs.append(model_input)
-
-    # n * 1chw -> nchw
-    model_inputs = torch.stack(model_inputs)
-
-    # compute output heatmap
-    output = pose_model(model_inputs.to(CTX))
-    coords, confidence = get_final_preds(
-        cfg,
-        output.cpu().detach().numpy(),
-        np.asarray(centers),
-        np.asarray(scales))
-
-    return coords, confidence
 
 def draw_skeleton_and_keypoints(frame, keypoints, confidence):
     """ 畫骨架和關鍵點 """
@@ -157,7 +141,7 @@ def load_bbox_from_json(json_path):
     
     # bbox 格式: [x, y, w, h] -> 轉換為 [(x1, y1), (x2, y2)]
     x, y, w, h = data['bbox']
-    bbox = [(x, y), (x + w, y + h)]
+    bbox = [(x, y), (x + w, y + h)] # box = [(x1, y1), (x2, y2)]
     return bbox, data['width'], data['height']
 
 
@@ -190,7 +174,7 @@ def save_empty_json(json_path, video_name, frame_number, fps):
     """ 儲存空的 json（假設拉 目前幀沒有對應 id 的數據，希望不會有）"""
     empty_data = {
         "video_name": video_name,
-        "frame_number": frame_number,
+        "frame": frame_number,
         "timestamp": frame_number / fps,
         "keypoints": []
     }
@@ -198,53 +182,25 @@ def save_empty_json(json_path, video_name, frame_number, fps):
     with open(json_path, 'w', encoding='utf-8') as f:
         json.dump(empty_data, f, indent=2, ensure_ascii=False)
 
-def box_to_center_scale(box, model_image_width, model_image_height):
-    """convert a box to center,scale information required for pose transformation
-    Parameters
-    ----------
-    box : list of tuple
-        list of length 2 with two tuples of floats representing
-        bottom left and top right corner of a box
-    model_image_width : int
-    model_image_height : int
-
-    Returns
-    -------
-    (numpy array, numpy array)
-        Two numpy arrays, coordinates for the center of the box and the scale of the box
-    """
-    center = np.zeros((2), dtype=np.float32)
-
-    bottom_left_corner = box[0]
-    top_right_corner = box[1]
-    box_width = top_right_corner[0]-bottom_left_corner[0]
-    box_height = top_right_corner[1]-bottom_left_corner[1]
-    bottom_left_x = bottom_left_corner[0]
-    bottom_left_y = bottom_left_corner[1]
-    center[0] = bottom_left_x + box_width * 0.5
-    center[1] = bottom_left_y + box_height * 0.5
-
-    aspect_ratio = model_image_width * 1.0 / model_image_height
-    pixel_std = 200
-
-    if box_width > aspect_ratio * box_height:
-        box_height = box_width * 1.0 / aspect_ratio
-    elif box_width < aspect_ratio * box_height:
-        box_width = box_height * aspect_ratio
-    scale = np.array(
-        [box_width * 1.0 / pixel_std, box_height * 1.0 / pixel_std],
-        dtype=np.float32)
-    if center[0] != -1:
-        scale = scale * 1.25
-
-    return center, scale
-
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Train keypoints network')
+    parser = argparse.ArgumentParser(description='ViTPose 2D pose estimation')
     # general
-    parser.add_argument('--cfg', type=str, required=True)
+    #parser.add_argument('--cfg', type=str, required=True)
     #parser.add_argument('--videoFile', type=str, required=True)
+
+    # 模型設定檔 (.py)。
+    parser.add_argument('--pose_config', type=str,
+                    default=r'configs/body/2d_kpt_sview_rgb_img/topdown_heatmap/coco/vitPose+_huge_coco+aic+mpii+ap10k+apt36k+wholebody_256x192_udp.py',
+                    help='ViTPose config file path')
+    
+    parser.add_argument('--pose_checkpoint', type=str, default=r'weights/vitpose_huge.pth',
+                       help='ViTPose checkpoint file path')
+    # 模型權重檔(我已經在上面那個模型設定檔準備好了)
+
+    parser.add_argument('--device', default='cuda:0',
+                       help='Device used for inference')
+    
     parser.add_argument('--input_dir', type=str,
                        default=r'D:\rcnn\PyTorch-Object-Detection-Faster-RCNN-Tutorial\test_videos')
                         # 這路徑是死的，你們要改可以自己改
@@ -259,59 +215,35 @@ def parse_args():
     #parser.add_argument('--inferenceFps', type=int, default=10)
     #parser.add_argument('--writeBoxFrames', action='store_true')
 
-    parser.add_argument('opts',
-                        help='Modify config options using the command-line',
-                        default=None,
-                        nargs=argparse.REMAINDER)
+
 
     args = parser.parse_args()
 
-    # args expected by supporting codebase
-    args.modelDir = ''
-    args.logDir = ''
-    args.dataDir = ''
-    args.prevModelDir = ''
     return args
 
 
 def main():
     # transformation
-    pose_transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225]),
-    ])
-
-    # cudnn related setting
-    cudnn.benchmark = cfg.CUDNN.BENCHMARK
-    torch.backends.cudnn.deterministic = cfg.CUDNN.DETERMINISTIC
-    torch.backends.cudnn.enabled = cfg.CUDNN.ENABLED
 
     args = parse_args()
-    update_config(cfg, args)
-    
-    
 
-
-    pose_model = eval('models.'+cfg.MODEL.NAME+'.get_pose_net')(
-        cfg, is_train=False
+    pose_model = init_pose_model(
+        args.pose_config,
+        args.pose_checkpoint,
+        device=args.device.lower()
     )
 
-    # 我仍然保留原作者的定義，只是我在 else的地方改為我下載的 hrnet 權重
-    if cfg.TEST.MODEL_FILE:
-        print('=> 原作者流程匯入權重 {}'.format(cfg.TEST.MODEL_FILE))
-        # pose_model.load_state_dict(torch.load(cfg.TEST.MODEL_FILE), strict=False)
-        # CTX 是我定義的 CUDA 使用，我要用 GPU 而不是 CPU
-        pose_model.load_state_dict(torch.load(cfg.TEST.MODEL_FILE, map_location=CTX), strict=False)
-
+    # 取得 dataset 資訊
+    dataset = pose_model.cfg.data['test']['type']
+    # 檢查 config 檔裡面有沒有定義 dataset_info (例如關鍵點叫啥、連線要連哪裡)
+    dataset_info = pose_model.cfg.data['test'].get('dataset_info', None)
+    if dataset_info is None:
+        warnings.warn('欸欸趕快去設定 dataset_info in the config'
+                    'Check https://github.com/open-mmlab/mmpose/pull/663 for details.',
+                    DeprecationWarning)
     else:
-        weights_path = r'D:\rcnn\deep-high-resolution-net.pytorch\demo\pose_hrnet_w48_384x288.pth'
-        print(f'=> 已載入自定義的權重喵 ~ {weights_path}')
-        # pose_model.load_state_dict(torch.load(weights_path), strict=False)
-        pose_model.load_state_dict(torch.load(weights_path, map_location=CTX), strict=False)
+        dataset_info = DatasetInfo(dataset_info)
 
-
-    pose_model.to(CTX)
     pose_model.eval()
 
     # Loading an video
@@ -342,7 +274,14 @@ def main():
         print(f'正在處理: {video_name}.mp4')
         
         """ 處理輸出路徑 """
-        video_output_dir = os.path.join(args.output_dir, video_name)
+        video_output_dir = os.path.join(args.output_dir, video_name) # 資料夾
+        output_video_path = os.path.join(args.output_dir, f'{video_name}.mp4') # 影片
+
+        if os.path.exists(video_output_dir) and os.path.exists(output_video_path):
+            print(f' 跳過: {video_name}.mp4 及 {video_name} 資料夾已存在，不覆蓋。')
+            print("\n")
+            continue # 跳過本次迴圈，處理下一個影片
+
         img_dir = os.path.join(video_output_dir, "img")
         id1_dir = os.path.join(video_output_dir, "1")
         id2_dir = os.path.join(video_output_dir, "2")
@@ -352,7 +291,6 @@ def main():
         os.makedirs(id1_dir, exist_ok=True)
         os.makedirs(id2_dir, exist_ok=True)
 
-        output_video_path = os.path.join(args.output_dir, f'{video_name}.mp4')
         
         cap = cv2.VideoCapture(v)
         fps = cap.get(cv2.CAP_PROP_FPS)
@@ -364,7 +302,7 @@ def main():
         # 輸出影片設定（並排）
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(output_video_path, fourcc, fps, 
-                            (frame_w * 2, frame_h))
+                            (frame_w, frame_h))
         
         # BBox JSON 資料夾
         bbox_id1_dir = os.path.join(args.bbox_base, video_name, '1')
@@ -397,12 +335,8 @@ def main():
             id1_data = load_bbox_from_json(id1_json_path)
             id2_data = load_bbox_from_json(id2_json_path)
             
-            # 準備圖像
-            if cfg.DATASET.COLOR_RGB:
-                image_pose = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            else:
-                image_pose = frame.copy()
-            
+
+            image_pose = frame
             # 收集所有 bbox
             all_boxes = []
             all_ids = []
@@ -418,21 +352,13 @@ def main():
             
             # 如果有 bbox 就處理
             if len(all_boxes) > 0:
-                centers = []
-                scales = []
-                for box in all_boxes:
-                    center, scale = box_to_center_scale(
-                        box, cfg.MODEL.IMAGE_SIZE[0], cfg.MODEL.IMAGE_SIZE[1]
-                    )
-
-                    centers.append(center)
-                    scales.append(scale)
-                
-                # 姿態估計
                 pose_preds, confidence = get_pose_estimation_prediction(
-                    pose_model, image_pose, centers, scales, transform=pose_transform
-                )
+                                        pose_model, image_pose, all_boxes, dataset, dataset_info)
                 
+                #print(f"第 {count} 幀: 姿勢推測的格式 shape = {pose_preds.shape}")
+                #print(f"  第一個關鍵點(如果是 coco 會是鼻子) = {pose_preds[0][0]}")  # nose
+                #print(f"  Frame size = {frame.shape[:2]}")
+
                 # 繪製並儲存
                 for keypoints, max_vals, person_id in zip(pose_preds, confidence, all_ids):
                     # 繪製到 skeleton_frame
@@ -455,15 +381,10 @@ def main():
                 save_empty_json(os.path.join(id2_dir, json_filename),
                             f'{video_name}.mp4', count, fps)
             
-            # 合併並排影片
-            combined_frame = np.zeros((frame_h, frame_w * 2, 3), dtype=np.uint8)
-            combined_frame[:, :frame_w] = origi_frame
-            combined_frame[:, frame_w:] = skeleton_frame
-            
             # 寫入影片和截圖
-            out.write(combined_frame)
+            out.write(skeleton_frame)
             img_path = os.path.join(img_dir, f'frame_{count:012d}.png')
-            cv2.imwrite(img_path, combined_frame)
+            cv2.imwrite(img_path, skeleton_frame)
 
         cap.release()
         out.release()
