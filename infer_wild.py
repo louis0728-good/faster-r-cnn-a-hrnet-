@@ -42,7 +42,7 @@ BASE_2D_DETECTION_DIR = r'../ultralytics/output_videos/2d_detections'
 BASE_VIDEO_DIR = r'../ultralytics/test_videos'
 # 影片輸入
 
-BASE_OUTPUT_DIR = r'/output_3d_vidoes'  # 建立一個新資料夾
+BASE_OUTPUT_DIR = r'./output_3d_vidoes'  # 建立一個新資料夾
 # 輸出
 
 def parse_args():
@@ -333,4 +333,5 @@ if __name__ == '__main__':
             if os.path.exists(temp_path):
                 os.remove(temp_path)
         
+
         print(f" {video_name} 好了！輸出至 {output_video_path}\n")
