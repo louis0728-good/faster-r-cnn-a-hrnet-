@@ -31,9 +31,10 @@ IOU_THRESHOLD = 0.75 # 追蹤功能(暫定用) 越高越嚴謹(超過代表相�
 # 自己模型就設 0.35
 
 CLASS = ['bg', 'pose'] # 背景是 0，"人臉" 是 1
-FEATURE_THRESHOLD = 0.80  # 特徵相似度閾值 越低越寬鬆
+FEATURE_THRESHOLD = 0.85  # 特徵相似度閾值 越低越寬鬆
 # 自己模型就設 0.70
 
+FE_IOU = 0.2 # 特徵符合且 IOU 相交大小，越大重疊越多
 alpha = 0.6 # 平滑數，值越小，舊記憶占比越重
 
 # --- 設定顏色區 ---
@@ -55,7 +56,7 @@ ID_COLORS = [ # ID 的顏色
 
 # --- 追蹤 --
 class DeepSORT:
-    def __init__(self, max_age=1200, min_hits=100, feature_threshold=FEATURE_THRESHOLD): # 
+    def __init__(self, max_age=1200, min_hits=25, feature_threshold=FEATURE_THRESHOLD): # 
         # min_hits 越小，ID 確認越快
         # max_age 越大，ID 越不容易斷
         self.max_age = max_age  # 最大消失幀數
@@ -186,7 +187,7 @@ class DeepSORT:
                     iou = self.calculate_iou(track['box'], box) # 然後換 IOU
                     
                     # 組合成本（特徵為主，IOU 為輔）
-                    if feat_sim > self.feature_threshold and iou > 0.3:
+                    if feat_sim > self.feature_threshold and iou >= FE_IOU:
                         cost = (1 - feat_sim) * 0.7 + (1 - iou) * 0.3
                         cost_matrix[i, j] = cost
                         # cost_matrix[i, j] 代表第 i 個追蹤物件與第 j 個偵測框之間的相似度。
@@ -771,7 +772,7 @@ def main():
         model = YOLO(r'weights\yolo11x.pt')  # 你的路徑
         # YOLO 不需要 .eval() 和 .to(device)，交給 API 處理
         
-    tracker = DeepSORT(max_age=1200, min_hits=100, feature_threshold=FEATURE_THRESHOLD)
+    tracker = DeepSORT(max_age=1200, min_hits=25, feature_threshold=FEATURE_THRESHOLD)
 
     #找出所有影片
     video_list = glob.glob(os.path.join(input_dir, '*.mp4'))
