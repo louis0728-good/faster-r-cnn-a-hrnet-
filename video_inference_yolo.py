@@ -34,7 +34,7 @@ CLASS = ['bg', 'pose'] # 背景是 0，"人臉" 是 1
 FEATURE_THRESHOLD = 0.80  # 特徵相似度閾值 越低越寬鬆
 # 自己模型就設 0.70
 
-alpha = 0.5 # 平滑數，值越小，舊記憶占比越重
+alpha = 0.6 # 平滑數，值越小，舊記憶占比越重
 
 # --- 設定顏色區 ---
 BBOX_COLOR = (0, 255, 0) # 綠色
@@ -55,7 +55,7 @@ ID_COLORS = [ # ID 的顏色
 
 # --- 追蹤 --
 class DeepSORT:
-    def __init__(self, max_age=1200, min_hits=10, feature_threshold=FEATURE_THRESHOLD): # 
+    def __init__(self, max_age=1200, min_hits=100, feature_threshold=FEATURE_THRESHOLD): # 
         # min_hits 越小，ID 確認越快
         # max_age 越大，ID 越不容易斷
         self.max_age = max_age  # 最大消失幀數
@@ -75,8 +75,8 @@ class DeepSORT:
         print(f"正在載入 Re-ID 模型 ({model_name})...")
         
         # 載入預訓練權重
-        model_weights_path = r'weights/osnet_x0_25_market_256x128_amsgrad_ep180_stp80_lr0.003_b128_fb10_softmax_labelsmooth_flip.pth'
-        #model_weights_path = r'weights/osnet_ain_x1_0_msmt17_256x128_amsgrad_ep50_lr0.0015_coslr_b64_fb10_softmax_labsmth_flip_jitter.pth'
+        #model_weights_path = r'weights/osnet_x0_25_market_256x128_amsgrad_ep180_stp80_lr0.003_b128_fb10_softmax_labelsmooth_flip.pth'
+        model_weights_path = r'weights/osnet_ain_x1_0_msmt17_256x128_amsgrad_ep50_lr0.0015_coslr_b64_fb10_softmax_labsmth_flip_jitter.pth'
 
         torchreid.utils.load_pretrained_weights(self.feature_extractor, model_weights_path)
         # 3. 設定為評估模式並移至 GPU
@@ -186,10 +186,14 @@ class DeepSORT:
                     iou = self.calculate_iou(track['box'], box) # 然後換 IOU
                     
                     # 組合成本（特徵為主，IOU 為輔）
-                    if feat_sim > self.feature_threshold or iou > IOU_THRESHOLD:
-                        cost = (1 - feat_sim) * 0.2 + (1 - iou) * 0.8
+                    if feat_sim > self.feature_threshold and iou > 0.3:
+                        cost = (1 - feat_sim) * 0.7 + (1 - iou) * 0.3
                         cost_matrix[i, j] = cost
                         # cost_matrix[i, j] 代表第 i 個追蹤物件與第 j 個偵測框之間的相似度。
+                    elif iou > IOU_THRESHOLD:
+                        cost = (1 - feat_sim) * 0.7 + (1 - iou) * 0.3
+                        cost_matrix[i, j] = cost
+
             
             # 匈牙利算法
             row_indices, col_indices = linear_sum_assignment(cost_matrix) # 輸出好像是兩個列表，代表各自對應的最小成本(最相似)
@@ -334,7 +338,7 @@ def load_model(checkpoint_path, device):
     return model
 """
 
-def is_light_color(image_rgb, box, bri=80, sat=90):    
+def is_light_color(image_rgb, box, bri=60, sat=110):    
     """
     判斷 bbox 中心點區域的衣物是否為淺色
         image_rgb: RGB 圖像
@@ -767,7 +771,7 @@ def main():
         model = YOLO(r'weights\yolo11x.pt')  # 你的路徑
         # YOLO 不需要 .eval() 和 .to(device)，交給 API 處理
         
-    tracker = DeepSORT(max_age=1200, min_hits=10, feature_threshold=FEATURE_THRESHOLD)
+    tracker = DeepSORT(max_age=1200, min_hits=100, feature_threshold=FEATURE_THRESHOLD)
 
     #找出所有影片
     video_list = glob.glob(os.path.join(input_dir, '*.mp4'))
