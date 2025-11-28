@@ -202,15 +202,15 @@ def parse_args():
                        help='Device used for inference')
     
     parser.add_argument('--input_dir', type=str,
-                       default=r'D:\rcnn\PyTorch-Object-Detection-Faster-RCNN-Tutorial\test_videos')
+                       default=r'../ultralytics/test_videos')
                         # 這路徑是死的，你們要改可以自己改
     # 因為我有自己的 faster r-cnn 所以我們這邊多加一個設定，bbox 的來源路徑
     parser.add_argument('--bbox_base', type=str,
-                       default=r'D:\rcnn\PyTorch-Object-Detection-Faster-RCNN-Tutorial\output_videos')
+                       default=r'../ultralytics/output_videos')
     
     #parser.add_argument('--outputDir', type=str, default='/output/')
     parser.add_argument('--output_dir', type=str, 
-                       default=r'D:\rcnn\PyTorch-Object-Detection-Faster-RCNN-Tutorial\output_videos\2d_detections')
+                       default=r'../ultralytics/output_videos/2d_detections')
     
     #parser.add_argument('--inferenceFps', type=int, default=10)
     #parser.add_argument('--writeBoxFrames', action='store_true')
@@ -272,6 +272,16 @@ def main():
     for v in video_files:
         video_name = os.path.splitext(os.path.basename(v))[0]
         print(f'正在處理: {video_name}.mp4')
+        
+        # 檢查 1: 是否有對應的資料夾，以免沒有 json folder 還假裝有硬抓，最後甚麼都沒有
+        check_folder = os.path.join(args.bbox_base, video_name)
+        # 檢查 2: 影片，同樣目的
+        check_video = os.path.join(args.bbox_base, os.path.basename(v))
+
+        if not os.path.exists(check_folder) or not os.path.exists(check_video):
+            print(f" [跳過] 找不到 YOLO 輸出數據: {video_name} (缺少資料夾或對應影片)")
+            print("\n")
+            continue
         
         """ 處理輸出路徑 """
         video_output_dir = os.path.join(args.output_dir, video_name) # 資料夾
