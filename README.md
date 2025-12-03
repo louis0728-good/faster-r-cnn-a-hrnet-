@@ -10,5 +10,6 @@
 ### 2d_detection.py 我放在 "ViTPose\demo\2d_detection.py"
 > 2d_detection.py 那個是我目前用別的 2d 檢測模型去跑的，你們要先 clone 到本機端，網址是 https://github.com/ViTAE-Transformer/ViTPose/tree/main
 > 流程就按照作者上面所說的就好，指令則是照我的 python demo/2d_detection.py
+>
 > 權重放置路徑 ViTPose\weights
 
