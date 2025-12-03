@@ -1,5 +1,4 @@
-### check_structure.py 我放置在 "D:\rcnn\A-HRNet\data\coco\annotations\check_structure.py" (目前可先不實作這步)
-### double_check.py 我放置在 "D:\rcnn\PyTorch-Object-Detection-Faster-RCNN-Tutorial\output_videos\double_check.py"
+
 ### video_inference_yolo.inynb 我放置在 "\ultralytics"
 > clone 專案連結: https://github.com/ultralytics/ultralytics
 > 一樣按照原作者說的流程安裝必要的套件或東西。
