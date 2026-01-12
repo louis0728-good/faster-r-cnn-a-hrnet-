@@ -12,3 +12,4 @@
 >
 > 權重放置路徑 ViTPose\weights
 
+### infer_wild.py, dataset_wild.py 是 MotionBert 的東西
