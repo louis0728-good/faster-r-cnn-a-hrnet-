@@ -67,7 +67,7 @@ class DeepSORT:
 
         # 載入預訓練模型，專門用於從影像中提取特徵向量，來區分不同的人。
         self.feature_extractor = torchreid.models.build_model(
-            name='osnet_x0_25',
+            name='osnet_ain_x1_0',
             num_classes=1, # 對特徵提取不重要
             loss='softmax', # 也跳過
             pretrained=False # 沒有要重訓練
