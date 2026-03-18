@@ -11,5 +11,5 @@
 > 流程就按照作者上面所說的就好，指令則是照我的 python demo/2d_detection.py
 >
 > 權重放置路徑 ViTPose\weights
-
-### infer_wild.py, dataset_wild.py 是 MotionBert 的東西
+> 
+### inference.py 我放在 "ViTPose\mmpose\apis" 覆蓋原本的就可以了
