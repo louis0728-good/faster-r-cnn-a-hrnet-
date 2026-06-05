@@ -56,7 +56,7 @@ ID_COLORS = [ # ID 的顏色
 
 # --- 追蹤 --
 class DeepSORT:
-    def __init__(self, max_age=120, min_hits=3, feature_threshold=FEATURE_THRESHOLD): # 
+    def __init__(self, max_age=120, min_hits=1, feature_threshold=FEATURE_THRESHOLD): # 
         # min_hits 越小，ID 確認越快
         # max_age 越大，ID 越不容易斷
         self.max_age = max_age  # 最大消失幀數
