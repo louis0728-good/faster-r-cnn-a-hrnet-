@@ -772,7 +772,7 @@ def main():
         model = YOLO(r'weights\yolo11x.pt')  # 你的路徑
         # YOLO 不需要 .eval() 和 .to(device)，交給 API 處理
         
-    tracker = DeepSORT(max_age=120, min_hits=3, feature_threshold=FEATURE_THRESHOLD)
+    tracker = DeepSORT(max_age=120, min_hits=1, feature_threshold=FEATURE_THRESHOLD)
 
     #找出所有影片
     video_list = glob.glob(os.path.join(input_dir, '*.mp4'))
