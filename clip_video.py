@@ -1,4 +1,4 @@
-import cv2, os, json, logging, numpy as np, re, torch, subprocess
+import cv2, os, json, logging, math, numpy as np, re, torch, subprocess
 from pathlib import Path
 from typing import Optional, List, Tuple
 from dataclasses import field
@@ -32,8 +32,8 @@ ROI_TITLES_ZH = {
     "score_left": "左比分",
     "score_right": "右比分",
     "period": "局",
-    "board_left": "左側板",
-    "board_right": "右側板",
+    "board_left": "左側板得分燈區",
+    "board_right": "右側板得分燈區",
 }
 
 logging.basicConfig(
@@ -73,25 +73,12 @@ class ThresholdConfig:
 
     # 調小更寬鬆 調大更嚴格
     board_color_change: float = 25
-
-    # 調小更寬鬆 調大更嚴格
-    #ui_visible_rate: float = 0.40 # 與參考幀的相似度低於此值 字卡不可見
-
     # 這邊單位都是 s 
     passivity_seconds: float = 50.00 # 比賽開始幾秒了(判定消極比賽用)
-    #passivity_stall_seconds: float = 50.0  # 單次停頓多久算消極(影片中途切入的保險)
-    stall_seconds: float = 1.00 # 消極判定時，計時器需停頓超過此秒數才確認
     ui_hasnt_show_up_min: float = 3.0 # 最後一個回合結束後，UI 字卡消失後 x 秒內沒出現，代表比賽結束了
     ui_timer_lag: float = 5.0 # 如果 ui 延遲出現可以容忍幾秒
-    ocr_timer_confidence: float = 0.50
-    ocr_other_confidence = 0.53
-    too_late_to_win_thres = 0.2
     votes_rate = 0.5
-    clip_jump_timer_delta: float = 4.5   # 時間突然減少超過幾秒就視為剪輯跳變
-    # 得分後,導播慢半拍才按暫停造成的多餘倒數,容許的「相鄰」幀數範圍
-    # 預設 = sample_interval 的 1 倍多一點,只擋緊鄰得分的那一兩幀
-    director_lag_frames: int = 20
-    timer_rise_limit: float = 3.0   # 回合中 timer 往上跳超過幾秒就視為誤讀,沿用前一幀
+    limit_ocr_height = 80 # 把 ocr 獨到的東西拉長(如果太矮)
 
 
 @dataclass
@@ -125,7 +112,7 @@ def set_window_title(cv2_name, zh_title): # 改中文
         pass
 
 class ZoomableROI:
-    def __init__(self, window_name, image, zh_title="", initial_scale=0.5):
+    def __init__(self, window_name, image, zh_title="", initial_scale=0.85):
         self.window_name = window_name
         self.zh_title = zh_title
         self.orig_img = image.copy()
@@ -205,11 +192,12 @@ class ZoomableROI:
 
 # 讀 ui 字卡
 class UICardReader:
-    def __init__(self, roi_config, threshold_config, frame_width: int, frame_height: int):
-        self.roi = roi_config
+    def __init__(self, roi_config, threshold_config, frame_w: int, frame_h: int):
+        self.roi_config = roi_config
         self.threshold_config = threshold_config
-        self.w = frame_width
-        self.h = frame_height
+        self.w = frame_w
+        self.h = frame_h
+
 
         if easyocr is not None:
             self.reader = easyocr.Reader(["en"], gpu=True, verbose=False)
@@ -217,11 +205,7 @@ class UICardReader:
             self.reader = None
             logger.warning("打 pip install easyocr")
 
-        # 快取上一幀的計分板顏色
-        self.prev_board_color_left: Optional[Tuple[float, float, float]] = None
-        self.prev_board_color_right: Optional[Tuple[float, float, float]] = None
 
-    
     def _crop(self, frame: np.ndarray, roi: Tuple[float, float, float, float]) -> np.ndarray:
         # 切 roi 區域
         rx, ry, rw, rh = roi
@@ -231,83 +215,93 @@ class UICardReader:
         y2 = int((ry + rh) * self.h)
         return frame[y1:y2, x1:x2]
 
-    def read_timer(self, frame, last_timer: Optional[float] = None):
-        crop = self._crop(frame, self.roi["timer"])
-        text, candidates = self.ocr_text(crop, allowlist="0123456789:.", title="時間", ocr_thresh=self.threshold_config.ocr_timer_confidence) # 錨點 時間點
-        timer_value = self.parse_timer_text(text, last_timer)
+    def read_timer(self, frame, last_known_timer: Optional[float] = None):
+        crop = self._crop(frame, self.roi_config["timer"])
+        text, candidates = self.ocr_text(crop, allowlist="0123456789:.", title="時間") # 錨點 時間點
+        timer_value = self.parse_timer_text(text, last_known_timer)
 
         was_repaired = False
         # 如果正常解析失敗，但 OCR 有讀到文字 → 啟動保守救援
         if timer_value is None:
-            timer_value = self._repair_timer_if_possible(candidates, last_timer)
+            # last_timer 就是 last_known_timer
+            timer_value = self._repair_timer_if_possible(candidates, last_known_timer)
             if timer_value is not None:
                 was_repaired = True
                 logger.debug(f"  ├─ [OCR 時間] 修補成功: 候選={candidates} → {timer_value}")
         return timer_value, was_repaired
 
     def read_score_left(self, frame) -> Optional[int]:
-        crop = self._crop(frame, self.roi["score_left"])
-        text, _ = self.ocr_text(crop, allowlist="0123456789", title="左選手成績", ocr_thresh=self.threshold_config.ocr_other_confidence)
+        crop = self._crop(frame, self.roi_config["score_left"])
+        text, _ = self.ocr_text(crop, allowlist="0123456789", title="左選手成績")
         return self.parse_score_text(text)
 
     def read_score_right(self, frame) -> Optional[int]:
-        crop = self._crop(frame, self.roi["score_right"])
-        text, _ = self.ocr_text(crop, allowlist="0123456789", title="右選手成績", ocr_thresh=self.threshold_config.ocr_other_confidence)
+        crop = self._crop(frame, self.roi_config["score_right"])
+        text, _ = self.ocr_text(crop, allowlist="0123456789", title="右選手成績")
         return self.parse_score_text(text)
 
-    def read_period(self, frame, last_period: Optional[int] = None):
-        crop = self._crop(frame, self.roi["period"])
-        text, _ = self.ocr_text(crop, allowlist="1234/", title="局", ocr_thresh=self.threshold_config.ocr_other_confidence)
+    def read_period(self, frame, last_known_period: Optional[int] = None):
+        crop = self._crop(frame, self.roi_config["period"])
+        text, _ = self.ocr_text(crop, allowlist="1234/", title="局")
         period_value = self.parse_period_text(text)
     
         was_repaired = False
-        if period_value is None and last_period is not None:
-            period_value = last_period   # 沿用上一幀
+        if period_value is None and last_known_period is not None:
+            period_value = last_known_period   # 沿用上一幀
             was_repaired = True
         return period_value, was_repaired
 
-    def _preprocess_variants(self, crop: np.ndarray, target_h: int = 80) -> List[np.ndarray]:
-        """
-        原 ROI ─┬─ 變體 A (灰階+CLAHE) ──→ EasyOCR ──→ "9"
-        ├─ 變體 B (Otsu)        ──→ EasyOCR ──→ "9"  
-        ├─ 變體 C (反向 Otsu)   ──→ EasyOCR ──→ "4"  ← 這個變體被字型騙了
-        └─ 變體 D (自適應)      ──→ EasyOCR ──→ "9"
-        """
+    def _variants(self, crop: np.ndarray) -> List[np.ndarray]:
+        # ocr 銳利化用的
+        USM_AMOUNT = 0.5    # 銳利化強度;輕微 0.3~0.6,>1.0 會出現白邊/光暈
+        USM_SIGMA  = 1.0    # 銳利化半徑;小字 0.8~1.2,太大邊緣會糊一圈
+        BIL_SIGMA  = 30     # 雙邊濾波去雜訊強度 20~40
+        CLAHE_CLIP = 2.0    # 對比強化 2.0~3.0;放大後雜訊太明顯就往下調
+         
         h, w = crop.shape[:2]
-        
-        if h < target_h:
-            scale = target_h / h
-            crop = cv2.resize(crop, (int(w * scale), target_h), 
-                            interpolation=cv2.INTER_CUBIC)
+        ocr_height = self.threshold_config.limit_ocr_height
+        if h < ocr_height:
+            scale = ocr_height / h
+            crop = cv2.resize(crop, (int(w * scale), ocr_height), 
+                            interpolation=cv2.INTER_LANCZOS4)
         
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        # (1) 保邊去雜訊:把放大後的壓縮雜訊壓掉,但保留筆畫邊緣。就是把邊邊去掉噪音點
+        denoised = cv2.bilateralFilter(gray, d=5, # 濾波器視窗
+                                   sigmaColor=BIL_SIGMA, sigmaSpace=BIL_SIGMA) # 顏色和空間差距，差多少算相似?
         
-        # CLAHE — 處理計分板背景漸層光暈
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(gray)
+        # (2) CLAHE:處理計分板背景漸層/光暈(放在去雜訊之後,避免放大雜訊)
+        clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP, tileGridSize=(8, 8))
+        #                   對比度限制放大程度         直方圖均衡化範圍
+        # 自適應直方圖均衡化
+        enhanced = clahe.apply(denoised)
         
-        variants = [enhanced]  # 變體 1:強化後灰階(保留最多細節)
+        # (3) Unsharp Mask = 真正的「銳利化」: 1.5*原圖 - 0.5*模糊
+        blur  = cv2.GaussianBlur(enhanced, (0, 0), sigmaX=USM_SIGMA)
+        sharp = cv2.addWeighted(enhanced, 1.0 + USM_AMOUNT, blur, -USM_AMOUNT, 0)
+        variants = [sharp]
         
         _, otsu = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        variants.append(otsu)  # 變體 2:標準 Otsu
+        variants.append(otsu)  # 變體 2:標準 Otsu(灰階變黑白)
         
-        _, otsu_inv = cv2.threshold(enhanced, 0, 255, 
-                                    cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        # 二值化系列「故意」用未銳利化的 enhanced,
+        # 否則 USM 的白邊光暈會被 Otsu 切成黑點/斷筆,反而扣分
+        _, otsu_inv = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
         variants.append(otsu_inv)  # 變體 3:反向(處理深底淺字 / 淺底深字未知的情況)
         
         adaptive = cv2.adaptiveThreshold(
             enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-            cv2.THRESH_BINARY, 31, 10
-        )
+            cv2.THRESH_BINARY, 31, 10 # 視窗範圍 和 平均值要扣掉的閾值
+        ) # 用高斯加權方式
         variants.append(adaptive)  # 變體 4:自適應(處理區域光線不均)
         
         return variants
 
-    def ocr_text(self, crop: np.ndarray, allowlist: str, title:str, ocr_thresh:float) -> Tuple[str, List[str]]:
+    def ocr_text(self, crop: np.ndarray, allowlist: str, title:str) -> Tuple[str, List[str]]:
         if self.reader is None:
-            return ""
+            return "", []
         
-        variants = self._preprocess_variants(crop)
+        variants = self._variants(crop)
         list_of_text_conf = []
 
         for v in variants:
@@ -374,7 +368,7 @@ class UICardReader:
                     .replace("O", "0"))
 
         if len(text) == 4 and text.isdigit():
-            if text[1] in ('3', '2'):                    # 第二個字元如果是 3 or 2
+            if text[1] in ('3', '2'): # 第二個字元如果是 3 or 2 ，我發現系統可能會誤會把 : 認為是 3 or 2
                 minutes = int(text[0])
                 seconds = int(text[2:])           # 取後面兩位當秒數
                 if 0 <= minutes <= 3 and 0 <= seconds <= 59:
@@ -384,71 +378,77 @@ class UICardReader:
         # 當 OCR 讀到 3.00 / 300 / 3:00 且上一刻 timer 很小時 → 直接當成 180 秒
         # 我把 3.0 刪掉了，因為有些比賽影片會以 3.0 作為 3 秒，而非 0:03。就是那麼機掰
         # 這樣做是為了避免系統誤會以為 倒數 3 秒時把它當作 新局開始。
+        # last_known_timer 是「總秒數」的 float 型態儲存，68 秒, 33 秒
         if text in ("3.00", "300", "3:00") or (len(text) == 3 and text.startswith("3") and text[1:].isdigit()):
-            if last_known_timer is None or last_known_timer <= 10.0:   # 上一刻是休息/結束狀態
-                logger.debug(f"[parse_timer_text] 偵測到新局開始的 '3.00'，強制解析為 180 秒")
+            if last_known_timer is None or last_known_timer == 180.0:   # 可能是新的局回合，或是剛開始錄影
+                logger.debug(f"[parse_timer_text] ocr 讀到'3?00'，可能是新的局回合，或是剛開始錄影，所以強制解析為 180 秒 (3分鐘)")
                 return 180.0
             
-        # ★ 新增: 嚴格格式檢查
-        # 合法 timer 格式只有 "M.SS" / "MM.SS" / "M:SS" / "MM:SS" 等
-        # 整體必須能完整匹配,否則視為 OCR 異常
-        if not re.fullmatch(r"\d{1,2}[.:]\d{1,2}", text):
-            logger.debug(f"[parse_timer_text] '{text}' 格式畸形,交給 _repair_timer_if_possible")
-            return None
-    
-        # 標準格式 M:S 分:秒
-        match = re.search(r"(\d{1}):(\d{2})", text)
-        if match:
-            minutes = int(match.group(1))
-            seconds = int(match.group(2))
-            return minutes * 60.0 + seconds
-
-        # 情況 2：OCR 讀出小數點 (可能真的是小數，也可能是冒號被誤認)
-        # 秒數小數格式（如 8.2 4.35 0.17）
-        match = re.search(r"(\d{1})\.(\d{1,2})", text)
-        if match:
-            # 這樣 9.1 就是 9.1，不會變成 9.01
-            possible_sss = float(match.group(0)) # 當作 秒.毫秒 (0.33)
-
-            digit1 = int(match.group(1))
-            digit2 = int(match.group(2))
-
-            # 擊劍一局最多 3 分鐘。如果第一位數 >=4 或是 ==3 但是後面的尾數並非0(代表已經超過極限了，可以判定應該不是 分:秒  
-            # (例如 4.35, 3.32、8.20)
-            # 那可以肯定應該是 秒:毫秒 s:ss
-            if digit1 >= 4 or digit1 ==3 and digit2 != 00:
-                return possible_sss
-            
-            # 第一位數是 0, 1, 2, 3 (電腦會讀成例如: 0.33、0.46、3.00)
-            # 有兩種可能代表，以 0.33 舉例，搞不好其實是: 0:33 秒 或 真的 0.33 毫秒 
-            possible_ms = float(digit1 * 60 + digit2)    # 當作 分:秒 (0.33 -> 真實 0:33 但 ocr 讀錯)
-
-            # 如果有歷史時間，看哪一個數字比較合理 (離上一幀比較近)
-            if last_known_timer is not None:
-                if abs(last_known_timer - possible_ms) <= abs(last_known_timer - possible_sss):
-                    return possible_ms
-                else:
-                    return possible_sss
-            else:
-                # 剛開局沒有歷史紀錄的防呆機制：
-                # 第一幀極大機率是正常的 分:秒 (包含 3:00、2:15、0:45 等等)
-                # 擊劍通常在 10 秒以下才會顯示小數點。所以如果後面的數字 >= 10，優先當成分:秒
-                if digit1 >= 1 or (digit1 == 0 and digit2 >= 10):
-                    return possible_ms
-                return possible_sss
-            
-        # 情況 3：小數點被 ocr 吃掉的純數字防呆，例如: 7.1 變成 71
-        # 只能是純數字，不能有任何其他東西
+        # 情況 3(原先放後面，但是我發現應該要再嚴格格式前面，不然跑不到)：小數點被 ocr 吃掉的純數字防呆，例如: 7.1 變成 71
+        # 只能是純數字，不能有任何其他東西 20260605
         match = re.search(r"^(\d+)$", text.strip())
-        if match:
+        if len(text) == 2 and match:
             num_str = match.group(1)
             num = int(num_str)
             
             if last_known_timer is not None:
                 # 假設 OCR 把 7.1 讀成了 71，或是 9.0 讀成 90
-                # 如果把數字除以 10 後，離上一幀 (例如 7.2) 差距小於 1 秒，就用他
-                if len(num_str) == 2 and abs(last_known_timer - (num / 10.0)) < 1.0:
+                # 如果把數字除以 10 後，離上一幀 (例如 7.2) 差距小於 2 秒，就用他
+                if len(num_str) == 2 and abs(last_known_timer - (num / 10.0)) <= 2.0:
                     return num / 10.0
+                
+        # 嚴格格式檢查
+        # 合法 timer 格式只有 "S.SS" / "M.SS" / "M:SS"，如果 OCR 讀到 M.SS 但實際上應該是 M:SS，也要在這裡被改回來。
+        # 整體必須能完整匹配,否則視為 OCR 異常
+        if not re.fullmatch(r"\d{1}[.:]\d{1,2}", text):
+            logger.debug(f"[parse_timer_text] '{text}' 格式畸形,交給「格式嘗試修復功能」")
+            return None
+    
+        # 標準格式 M:S 分:秒，順便過濾那些不可能合理的時間(前面都搞格式 現在要去看時間加起來 是否會超過西洋劍比賽的規定賽制時間)
+        match = re.search(r"(\d{1}):(\d{2})", text)
+        if match:
+            minutes = int(match.group(1))
+            seconds = int(match.group(2))
+            if seconds > 59 or minutes > 3:          # 秒數非法 / 超過上限
+                return None
+            total = minutes * 60.0 + seconds
+            return total if total <= 180.0 else None  # 擋住 3:30=210 這種
+
+        # 情況 2：OCR 讀出小數點 (可能真的是小數，也可能是冒號被誤認)
+        # 秒數小數格式（如 8.2 4.35 0.17）
+        match = re.search(r"(\d{1})\.(\d{1,2})", text)
+        if match:
+            digit1 = int(match.group(1))
+            digit2 = int(match.group(2))
+
+            # 這樣 9.1 就是 9.1，不會變成 9.01
+            possible_sss = float(match.group(0)) # 當作 秒.毫秒 (0.33)
+            # 第一位數是 0, 1, 2, 3 (電腦會讀成例如: 0.33、0.46、3.00)
+            # 有兩種可能代表，以 0.33 舉例，搞不好其實是: 0:33 秒 或 真的 0.33 毫秒 
+            possible_ms = float(digit1 * 60 + digit2)    # 當作 分:秒 (0.33 -> 真實 0:33 但 ocr 讀錯)
+
+            # 擊劍一局最多 3 分鐘。如果第一位數 >=4 或是 ==3 但是後面的尾數並非0(代表已經超過極限了，可以判定應該不是 分:秒  
+            # (例如 4.35, 3.32、8.20)
+            # 那可以肯定應該是 秒:毫秒 s:ss
+            if digit1 >= 4 or (digit1 ==3 and digit2 != 00):
+                result = possible_sss
+            
+
+            # 如果有歷史時間，看哪一個數字比較合理 (離上一幀比較近)
+            if last_known_timer is not None:
+                if abs(last_known_timer - possible_ms) <= abs(last_known_timer - possible_sss):
+                    result = possible_ms
+                else:
+                    result = possible_sss
+            else:
+                """ 這邊有邏輯上的問題，如果第一幀輸入是 0.17 秒這種東西(代表 1ss7 那就只能吃大便了)，不改是因為這個情況很少觸發"""
+                # 剛開局沒有歷史紀錄的防呆機制：
+                # 第一幀極大機率是正常的 分:秒 (包含 3:00、2:15、0:45 等等)
+                # 擊劍通常在 10 秒以下才會顯示小數點。所以如果後面的數字 >= 10，優先當成分:秒
+                if digit1 >= 1 or (digit1 == 0 and digit2 >= 10):
+                    result = possible_ms
+
+            return result if result < 180.0 else None
 
         return None
     
@@ -458,7 +458,7 @@ class UICardReader:
                                last_known_timer: Optional[float]) -> Optional[float]:
         """
         當 parse_timer_text 解不出 timer 時的救援。
-        用「上一幀的 (分, 秒) pair」當 anchor,從候選字串中找最合理的 timer。
+        用「上一幀的數字 pair」當 anchor,從候選字串中找最合理的 timer。
         僅在分:秒區段 (last_known_timer > 10) 啟用,避免跟 parse_timer_text 的
         秒.毫秒邏輯打架。
         """
@@ -490,6 +490,8 @@ class UICardReader:
                 attempts.add((int(digits[0]), int(digits[2:4])))
                 # 中間兩位當秒(備用)
                 attempts.add((int(digits[0]), int(digits[1:3])))
+                # 多加一個 如果最左邊那個是誤讀
+                attempts.add((int(digits[1]), int(digits[2:4])))
             else:
                 continue
 
@@ -510,8 +512,8 @@ class UICardReader:
 
     @staticmethod
     def _repair_score_if_possible(
-        raw_sl: Optional[int],
-        raw_sr: Optional[int],
+        curr_sl: Optional[int],
+        curr_sr: Optional[int],
         last_known_score: List[Optional[int]],
     ) -> Tuple[Optional[int], Optional[int], bool]:
         """
@@ -519,15 +521,15 @@ class UICardReader:
         不看 light、不看 timer (因為亮燈時 OCR 本來也不會即時更新,沿用等同預期行為)。
         回傳: (修補後 sl, 修補後 sr, 是否有修補)
         """
-        if raw_sl is not None and raw_sr is not None:
-            return raw_sl, raw_sr, False   # 兩邊都有,不用修
+        if curr_sl is not None and curr_sr is not None:
+            return curr_sl, curr_sr, False   # 兩邊都有,不用修
         
         if last_known_score[0] is None and last_known_score[1] is None:
-            return raw_sl, raw_sr, False   # 沒歷史值可抄
+            return curr_sl, curr_sr, False   # 沒歷史值可抄
         
-        new_sl = raw_sl if raw_sl is not None else last_known_score[0]
-        new_sr = raw_sr if raw_sr is not None else last_known_score[1]
-        repaired = (raw_sl is None or raw_sr is None) and new_sl is not None and new_sr is not None
+        new_sl = curr_sl if curr_sl is not None else last_known_score[0]
+        new_sr = curr_sr if curr_sr is not None else last_known_score[1]
+        repaired = (curr_sl is None or curr_sr is None) and new_sl is not None and new_sr is not None
         return new_sl, new_sr, repaired
 
     @staticmethod
@@ -561,11 +563,11 @@ class UICardReader:
 
     # 有沒有亮紅/綠燈得分
     def detect_light_left(self, frame: np.ndarray) -> bool:
-        crop = self._crop(frame, self.roi["board_left"])
+        crop = self._crop(frame, self.roi_config["board_left"])
         return self.is_light_on_left(crop)
 
     def detect_light_right(self, frame: np.ndarray) -> bool:
-        crop = self._crop(frame, self.roi["board_right"])
+        crop = self._crop(frame, self.roi_config["board_right"])
         return self.is_light_on_right(crop)
 
     def is_light_on_left(self, crop: np.ndarray) -> bool:
@@ -578,13 +580,12 @@ class UICardReader:
         mask1 = cv2.inRange(hsv, r_lo1, r_up1)
         mask2 = cv2.inRange(hsv, r_lo2, r_up2)
         mask_red = cv2.bitwise_or(mask1, mask2)
-        red_ratio = cv2.countNonZero(mask_red) / crop.size
 
         s_min = self.threshold_config.light_sat_min
         v_min = self.threshold_config.bright_min
         sat_bright_mask = cv2.inRange(hsv, (0, s_min, v_min), (179, 255, 255))
         final_mask = cv2.bitwise_and(mask_red, sat_bright_mask)
-        red_ratio = cv2.countNonZero(final_mask) / crop.size
+        red_ratio = cv2.countNonZero(final_mask) / final_mask.size
         return red_ratio > self.threshold_config.rg_color_ratio
 
     def is_light_on_right(self, crop: np.ndarray) -> bool:
@@ -594,36 +595,34 @@ class UICardReader:
         g = self.threshold_config.green_range
         
         mask = cv2.inRange(hsv, (g[0], s_min, v_min), (g[1], 255, 255))
-        green_ratio = cv2.countNonZero(mask) / crop.size
+        green_ratio = cv2.countNonZero(mask) / mask.size
         return green_ratio > self.threshold_config.rg_color_ratio
     
     # 取得「計分板背景色」
     def get_board_color_left(self, frame: np.ndarray) -> Tuple[float, float, float]:
-        crop = self._crop(frame, self.roi["board_left"])
+        crop = self._crop(frame, self.roi_config["board_left"])
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
         return tuple(np.mean(hsv.reshape(-1, 3), axis=0))
 
     def get_board_color_right(self, frame: np.ndarray) -> Tuple[float, float, float]:
-        crop = self._crop(frame, self.roi["board_right"])
+        crop = self._crop(frame, self.roi_config["board_right"])
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
         return tuple(np.mean(hsv.reshape(-1, 3), axis=0))
     
     def read_frame(self, frame: np.ndarray, frame_number: int, 
-                            fps: float, last_timer: Optional[float] = None, last_known_score=None, 
-                                                last_period=None, prev_ui_visible=True) -> FrameInfo:
+                            fps: float, last_known_timer: Optional[float] = None, last_known_score=[None, None], 
+                                                last_known_period=None, prev_ui_visible=True) -> FrameInfo:
         info = FrameInfo()
         info.frame_number = frame_number
         info.timestamp = frame_number / fps if fps > 0 else 0.0
 
         # 各欄位讀取(timer/period 現在回傳 tuple)
-        info.timer_value, timer_repaired = self.read_timer(frame, last_timer)
+        info.timer_value, timer_repaired = self.read_timer(frame, last_known_timer)
         info.score_left = self.read_score_left(frame)
         info.score_right = self.read_score_right(frame)
-        info.period, period_repaired = self.read_period(frame, last_period)
 
-        # === 新增：更清楚的 score 修補 log ===
-        raw_sl = info.score_left
-        raw_sr = info.score_right
+        curr_sl = info.score_left
+        curr_sr = info.score_right
 
          # 新增: 沒讀到的分數沿用上一幀
         info.score_left, info.score_right, score_repaired = self._repair_score_if_possible(
@@ -631,25 +630,27 @@ class UICardReader:
         )
         if score_repaired:
             repaired_msg = []
-            if raw_sl is None:
-                repaired_msg.append(f"ocr 失效，左側根據前幀推論 (None → {info.score_left})")
-            if raw_sr is None:
-                repaired_msg.append(f"ocr 失效，右側根據前幀推論 (None → {info.score_right})")
+            if curr_sl is None:
+                repaired_msg.append(f"ocr 失效，左側分數直接根據前幀推論 (None → {info.score_left})")
+            if curr_sr is None:
+                repaired_msg.append(f"ocr 失效，右側分數直接根據前幀推論 (None → {info.score_right})")
             
             logger.debug(
                 f"[幀 {frame_number}] [score 修補] {' + '.join(repaired_msg)}"
             )
 
-        # ★ 補償計數投票 ★
+        info.period, period_repaired = self.read_period(frame, last_known_period)
+
+        # 補償計數投票，看此幀用多少東西去補償
         # 分開計算「左右分數」各算一票,所以總票數最多 4 票(timer/score_left/score_right/period)
         repair_votes = 0
         if timer_repaired:
             repair_votes += 1
         if period_repaired:
             repair_votes += 1
-        if raw_sl is None and info.score_left is not None:   # 左分數是補出來的
+        if curr_sl is None and info.score_left is not None:   # 左分數是補出來的
             repair_votes += 1
-        if raw_sr is None and info.score_right is not None:  # 右分數是補出來的
+        if curr_sr is None and info.score_right is not None:  # 右分數是補出來的
             repair_votes += 1
             
         missing = []
@@ -665,7 +666,7 @@ class UICardReader:
         # 原本的邏輯，照用
         if missing:
             info.ui_visible = False
-            logger.debug(f"[幀 {frame_number}] 補償後仍缺 {' + '.join(missing)}，判定 UI 消失")
+            logger.debug(f"[幀 {frame_number}] 嘗試補償後仍缺 {' + '.join(missing)}，判定 UI 消失")
             return info
         
         # 規則2:補償票數過半(>=3),且前一幀已經是 UI 消失 → 這幀極不可信,判消失
@@ -720,6 +721,8 @@ class RoundRecord:
     score_invalidated: bool = False
     is_disputed: bool = False           # 新增: 此回合經過 reconcile 修正
     dispute_type: str = ""              # 新增: "void"(假回合) / "wrong_winner"(誤判方向) / ""
+    pause_segments: List[Tuple[int, int]] = field(default_factory=list) 
+    # 讓這個自己記錄那些東西要切，因為現在如果回合是異常型態被結束，那會忽略原本這個回合內可能發生的暫停事件。 20260605
 
     # 僅在 match_end=True 時寫入
     match_winner: Optional[str] = None
@@ -755,56 +758,48 @@ class RoundRecord:
         return d
     
 class RoundDetector:
-    def __init__(self, threshold_config: ThresholdConfig, fps: float):
-        self.thresh = threshold_config
+    def __init__(self, threshold_config: ThresholdConfig, fps: float, sample_interval: float = 15.0):
+        # 先重置所有狀態
+        self.threshold_config = threshold_config
         self.fps = fps
+        self.sample_interval = sample_interval
         self.state = State.WAITING_FOR_START
         self.last_known_timer: Optional[float] = None
         self.last_known_score: List[Optional[int]] = [None, None]
+        self.last_known_period: Optional[int] = None 
+        
         self.no_score_added_count: float = 0.0  # 從上一次得分之後，到現在已經過了多久
-        self.no_score_added_count_before_last_round: float = 0.0   # 專門只針對那種上回合判錯，不算是一個回合時 消極比賽倒數會繼續數的功能
         self.prev_timer: Optional[float] = None  # 上一幀的計時器讀數
-        self.timer_stall_count: int = 0 # 計時器未變化的連續幀數
+        self.timer_stall_count_frame: int = 0 # 計時器未變化的連續幀數
         self.timer_stall_start_frame: int = 0 # 停頓開始的幀號
         self.light_seen_during_stall_left: bool = False   # 本次停頓期間,左燈是否曾經亮過
         self.light_seen_during_stall_right: bool = False  # 本次停頓期間,右燈是否曾經亮過
         self.board_changed_seen_during_stall: bool = False  # 本次停頓期間,板色是否曾明顯變化
         self._init_score_buf: dict = {'left': [], 'right': []} # 初始幀緩衝
+        # 時間軌跡守門用的 pending 狀態(取代現在修正時間跳躍太多的硬掰法)
+        self.timer_pending: bool = False
+        self.timer_pending_base: Optional[float] = None    # 異常發生時的舊基準
+        self.timer_pending_value: Optional[float] = None   # 候選的新軌跡起點
+        self.timer_pending_n: int = 0
 
         # 回合
-        self.current_period: int = 1
+        self.current_period_sysself_count: int = 1
         self.round_count: int = 0
-        self.current_round_start_frame: int = 0
-        self.current_round_start_time: float = 0.0
-        self.current_round_timer_start: Optional[float] = None
-        self.timer_at_last_score: Optional[float] = None
-        self.prev_round_score: List[int] = [0, 0]
+        self.current_round_start_frame: int = 0 # 跟下面一樣 只是單位 frame
+        self.current_round_start_time: float = 0.0 # 這回合的開始時間(影片為主)
+        self.current_round_timer_start: Optional[float] = None # 計時器的開始時間(ui 記分板為主)
+        self.score_when_round_open: List[int] = [0, 0]
         self.rounds: List[RoundRecord] = []
-        #self.last_low_timer: Optional[float] = None
-        self.after_period_end: bool = False
-        self.last_seen_period: Optional[int] = None 
+        self.after_period_end: bool = False # 局間回合系統應該要無視這段時間的 ui 資料
         # 這兩個都是為了去準備說 局結束間的1分鐘到計時休息時間 那個不能算回合
         self.last_record_needs_rewrite: bool = False  # 上一個 record 被校正過,要重寫 JSON
 
         # 字卡
         self.prev_ui_visible: bool = False
         self.ui_disappeared_frame: int = 0
-        self.last_score_frame: int = -1   # 上次「得分類」回合結束的幀號,-1 代表還沒發生過
-        #self.gap_pending: bool = False  # 字卡消失期間是否有缺口
         self.is_first_ui_appearance: bool = True # 為了第一幀
-        self.passivity_count: int = 0
+        self.passivity_count: int = 0 # 單位是次數，不是秒數
 
-        # 記分板顏色
-        self.prev_board_color_left: Optional[Tuple[float, float, float]] = None
-        self.prev_board_color_right: Optional[Tuple[float, float, float]] = None
-        self.board_color_at_stall_left: Optional[Tuple[float, float, float]] = None
-        # 計時器暫停時 可能的左右邊得分
-        self.board_color_at_stall_right: Optional[Tuple[float, float, float]] = None
-        self.frames_since_light_left: int = 30  # 距離上次左燈亮過了幾幀
-        self.frames_since_light_right: int = 30
-        # 記錄最後一次亮燈的「絕對幀號」
-        self.last_light_left_frame: int = -9999
-        self.last_light_right_frame: int = -9999
         # 新增：每個回合開始時的固定 board_color 基準
         self.reference_board_color_left: Optional[Tuple[float, float, float]] = None
         self.reference_board_color_right: Optional[Tuple[float, float, float]] = None
@@ -834,20 +829,27 @@ class RoundDetector:
         if last is None:
             buf = self._init_score_buf[side]
             buf.append(new_value)
-            if len(buf) >= 3:
+            if len(buf) >= 3: # # 連續 3 幀中至少有 2 幀相同
                 most_common, count = Counter(buf[-3:]).most_common(1)[0] # 讀取緩衝
                 if count >= 2:  # 連 3 幀裡至少 2 幀同值才採信
                     self.last_known_score[idx] = most_common
                     logger.debug(f"[初始化] {side} 分數鎖定為 {most_common} "
                                 f"(前 3 幀讀取結果: {buf[-3:]})")
+                else:
+                    if side == 'left': info.score_left = None
+                    else: info.score_right =  None
+
+            else: # 還沒收集三幀 先不要相信，先跳過
+                if side == 'left': info.score_left = None
+                else: info.score_right =  None
             return
         
 
         # 新增: 回合間期 (STALLED/WAITING) OCR 延遲是正常現象,默默忽略倒退
         # 不更新 last_known_score、不印 log、不修補 info.score
         # 留 info.score 是原始 OCR 值給 reconcile 用
-        if self.state in (State.TIMER_STALLED, State.WAITING_FOR_START, State.WAITING_FOR_NEW_PERIOD):
-                return
+        if self.state in (State.TIMER_STALLED, State.WAITING_FOR_START, State.WAITING_FOR_NEW_PERIOD, State.MATCH_ENDED):
+            return
             
         # Case B:已有歷史,驗證 delta
         delta = new_value - last
@@ -856,7 +858,7 @@ class RoundDetector:
             # 倒退不接受 — 分數的物理約束
             logger.debug(f"[幀 {info.frame_number}] {side} 分數倒退 ({last} → {new_value}), 沿用上一幀")
             if side == 'left':
-                info.score_left = last           # ← 新增:把 info 也改回上一幀
+                info.score_left = last      
             else:
                 info.score_right = last
             return
@@ -865,9 +867,8 @@ class RoundDetector:
             # 跨度可疑:正常取樣下不會跳超過 1
             logger.debug(f"[幀 {info.frame_number}] {side} 分數跨度可疑 "
                         f"({last} → {new_value}), 沿用上一幀分數")
-            # last_known_score 不變 (這行 self.last_known_score[idx] = last 是多餘的,可拿可留)
             if side == 'left':
-                info.score_left = last           # ← 新增
+                info.score_left = last
             else:
                 info.score_right = last
             return
@@ -875,36 +876,23 @@ class RoundDetector:
         self.last_known_score[idx] = new_value
 
     def process_frame(self, info: FrameInfo) -> Optional[RoundRecord]:
-        should_update_timer = True
+        if (self.prev_ui_visible and info.ui_visible
+            and self.state in (State.IN_ROUND, State.TIMER_STALLED)):
+            status, record = self._timer_gatekeeper(info)
+            if status == "clip":
+                self.prev_ui_visible = True
+                return record
+            if status == "freeze":
+                self.prev_ui_visible = True
+                return None
+            # status == "pass" 往下正常處理
 
-        # 新增:回合中 timer 突然往上跳很多 → 誤讀,沿用前一幀的數字繼續
-        if (self.state == State.IN_ROUND
-                and info.timer_value is not None
-                and self.last_known_timer is not None
-                and info.timer_value > self.last_known_timer + self.thresh.timer_rise_limit):
-            logger.warning(
-                f"[幀 {info.frame_number}] 回合中 timer 反而往上跳 "
-                f"{self.format_timer(self.last_known_timer)} → {self.format_timer(info.timer_value)}"
-                f"，視為誤讀 → 沿用前一幀 {self.format_timer(self.last_known_timer)}"
-            )
-            info.timer_value = self.last_known_timer
-            
-        # 新增：UI 持續顯示下的剪輯跳變偵測
-        if self.prev_ui_visible and info.ui_visible:
-            is_real_jump, should_update_timer = self._detect_clip_jump(info)
-            if is_real_jump:
-                record = self.handle_clip_jump(info)
-                if record is not None:
-                    self.prev_ui_visible = True
-                    return record   # 直接讓 MAIN_PIPELINE 去 clip + save json
-                
+        # UI 消失:撕標籤前先清掉時間 pending(避免殘留誤判)
         if not info.ui_visible and self.prev_ui_visible:
-            # 上一幀還看得到，這一幀突然不見了 記錄消失瞬間的狀態
+            self._clear_timer_pending()
             if self.state in (State.IN_ROUND, State.TIMER_STALLED):
                 logger.debug(f"[幀 {info.frame_number}] UI 字卡消失，記錄最後已知狀態")
                 self.ui_disappeared_frame = info.frame_number
-
-            # 無論在什麼狀態，只要 UI 不見了，標籤就必須撕掉！  
             self.prev_ui_visible = False
             return None
 
@@ -913,7 +901,7 @@ class RoundDetector:
             if self.is_first_ui_appearance:
                 logger.debug(f"[幀 {info.frame_number}] 首次偵測到 UI 字卡，開始追蹤")
                 self.is_first_ui_appearance = False  # 撕掉標籤，以後就是「重新出現」了
-            else:
+            else: # 不是第一次前面沒有現在有了
                 if self.state in (State.IN_ROUND, State.TIMER_STALLED):
                     record = self.handle_ui_reappear(info)
                     if record is not None:
@@ -924,13 +912,13 @@ class RoundDetector:
                         return record
                 else:
                     # 局間休息、等待新局、比賽結束期間的 UI 波動 → 一律忽略
+                    # 這邊就是在賭 ocr 和補償、投票機制能不能好好擋住 ui  消失時 roi 可能誤讀的訊息
                     logger.debug(f"[幀 {info.frame_number}] 休息/等待/新回合開始第一幀，期間 UI 重現")
                     self.prev_ui_visible = True
-                    #return None
 
-        # ★ 新增:UI 持續不可見期間,雜訊幀一律不更新任何跨幀狀態 ★
+        # UI 持續不可見期間,雜訊幀一律不更新任何跨幀狀態
         # 只有「可見 → 不可見」的轉折幀(上面已處理)和「不可見 → 可見」的重現幀(上面已處理)
-        # 會走到這裡。若這幀依然不可見,代表還在空白期,直接凍結狀態返回。
+        # 會走到這裡。若這幀依然不可見,代表還在中間過渡期,直接凍結狀態返回。
         if not info.ui_visible:
             self.prev_ui_visible = False
             logger.debug(f"[幀 {info.frame_number}] UI 持續消失中,凍結狀態(不更新 timer/score/燈號記憶)")
@@ -938,17 +926,10 @@ class RoundDetector:
 
         self.prev_ui_visible = info.ui_visible
 
-        # 更新燈號計數
-        if info.light_left:
-            self.last_light_left_frame = info.frame_number
-        if info.light_right:
-            self.last_light_right_frame = info.frame_number
-        self.frames_since_light_left = info.frame_number - self.last_light_left_frame
-        self.frames_since_light_right = info.frame_number - self.last_light_right_frame
 
         # 更新 last_known 狀態(變成目前狀態，等等會更新目前狀態，因為所謂的目前狀態應該是指上一幀)
         # 時間
-        if info.timer_value is not None and should_update_timer:
+        if info.timer_value is not None:
             if self.state == State.WAITING_FOR_NEW_PERIOD and self.after_period_end:
                 # 只有當讀到的時間非常接近 3:00 (大於 175 秒)，代表新局真的開始了，才放行更新
                 if info.timer_value >= 175.0:
@@ -957,16 +938,9 @@ class RoundDetector:
                 self.last_known_timer = info.timer_value
 
         # 更新成績
+        # 這邊會改 last_known_score 
         self._update_score_validated(info, 'left')
         self._update_score_validated(info, 'right')
-
-        # 更新計分板顏色
-        if info.board_color_left is not None:
-            self.prev_board_color_left = info.board_color_left
-        if info.board_color_right is not None:
-            self.prev_board_color_right = info.board_color_right
-
-        
 
         if self.state == State.WAITING_FOR_START: # 上一回合已經結束（或還沒開始），等計時器再次開始倒數的那段空檔。
             return self.waiting_for_start(info)
@@ -997,25 +971,6 @@ class RoundDetector:
             return None
 
         if self.prev_timer is not None and info.timer_value < self.prev_timer:
-
-            """ 同理 都先 ban ，因為暫停時間改為 60 幀
-            # ★ 新增:導播遲滯攔截 ★
-            # 若剛得分完,且這一幀「緊鄰」得分幀(在 director_lag_frames 內),
-            # 代表這次倒數極可能是導播慢半拍才按暫停造成的多餘倒數,而非新回合。
-            # 忽略這一幀:不開新回合、不跑 reconcile,但要更新 prev_timer 讓下一幀能正常比較。
-            if self.last_score_frame >= 0:
-                frames_since_score = info.frame_number - self.last_score_frame
-                if 0 < frames_since_score <= self.thresh.director_lag_frames:
-                    logger.info(
-                        f"[幀 {info.frame_number}] 偵測到緊鄰得分({self.last_score_frame})的倒數 "
-                        f"timer={self.format_timer(info.timer_value)},距得分僅 {frames_since_score} 幀,"
-                        f"判定為導播慢半拍補按暫停,忽略此幀,不開新回合"
-                    )
-                    # 用掉這次機會,避免下一幀又被擋(下一幀就讓它正常判定回合開始)
-                    self.last_score_frame = -1
-                    self.prev_timer = info.timer_value   # ← 關鍵:更新 prev_timer
-                    return None
-            """
             
             # 第一局第一回合開始
             # 字卡顯示 1/3、分數 0:0，且計時器從 3:00 附近開始倒數
@@ -1025,23 +980,23 @@ class RoundDetector:
                 and info.period == 1
                 and info.score_left == 0
                 and info.score_right == 0
-                and info.timer_value >= (180.0 - self.thresh.ui_timer_lag)
+                and info.timer_value >= (180.0 - self.threshold_config.ui_timer_lag)
             )
 
             # 上一回合結束後（計時器處於停頓狀態），計時器數值再次開始往下掉
             is_continuation = (
                 self.round_count > 0
                 and self.prev_timer is not None
-                and info.timer_value < 180 # 原 < self.prev_timer
+                and info.timer_value < 180 # 原 < self.prev_timer\
+                # 故意改成 180，因為比賽的導播有些會腦殘，明明就時間停止了偏偏給你再多補一秒回去。
+                # 改 180 就是賭說，不會有導播往另一邊耍憨，再給你偷偷減一秒，但其實新回合還沒開始。
             )
 
             # 影片有可能從後面的回合或段落剪輯，這裡是假設對於系統來說第一次，但是對於真實比賽來說已經進行一陣子的影片
             # 只要 round_count == 0，且不符合完美開局的條件 (有分數、或是局數 >1、或是時間已經明顯小於 3:00)
             # 因為是中途切入，我們「不需要等時間掉」，直接當作回合已經在進行中，立刻強制開局
-            has_score = (info.score_left is not None and info.score_left > 0) or \
-                        (info.score_right is not None and info.score_right > 0)
-            not_first_period = (info.period is not None and info.period > 1)
-            tolerate_ui_lag = (info.timer_value < 180.0 - self.thresh.ui_timer_lag)
+            tolerate_ui_lag = (info.timer_value < 180.0 - self.threshold_config.ui_timer_lag)
+            # 不用擔心 甚麼 timer_value 跟 上一幀一樣會連續觸發的問題，因為最前面有一個擋下來的if 條件
 
             is_first_period_for_system_but_not_for_MAMA = (
                 self.round_count == 0 and tolerate_ui_lag)
@@ -1068,8 +1023,6 @@ class RoundDetector:
         if info.timer_value == 0.0:
             if self.timer_stall_start_frame == 0:
                 self.timer_stall_start_frame = info.frame_number
-                self.board_color_at_stall_left = info.board_color_left
-                self.board_color_at_stall_right = info.board_color_right
             
             self.state = State.TIMER_STALLED
             # 立刻丟給 timer_stalled 處理 (如果是壓哨得分，它會先被 get_point 攔截；如果沒有，就會順利進 times_up)
@@ -1082,16 +1035,13 @@ class RoundDetector:
         if self.prev_timer is None or info.timer_value != self.prev_timer:
         # 第一次讀，或 timer 值剛剛改變 → 立刻重設停頓起點
             self.timer_stall_start_frame = info.frame_number
-            self.timer_stall_count = 0
-            # 記錄這一刻的計分板顏色，作為日後變化比對基準
-            self.board_color_at_stall_left = info.board_color_left
-            self.board_color_at_stall_right = info.board_color_right
+            self.timer_stall_count_frame = 0
             self.light_seen_during_stall_left = False
             self.light_seen_during_stall_right = False
             self.board_changed_seen_during_stall = False
         else:
             # timer 跟上一幀相同 → 累計
-            self.timer_stall_count = info.frame_number - self.timer_stall_start_frame
+            self.timer_stall_count_frame = info.frame_number - self.timer_stall_start_frame
             # 新增: 持續觀察,只要這次停頓期間任何一幀亮過燈,就記住
             if info.light_left:
                 self.light_seen_during_stall_left = True
@@ -1101,14 +1051,14 @@ class RoundDetector:
             # 板色照燈號的模式:停頓期間變過一次就記住
             if info.board_color_left and self.reference_board_color_left:
                 if np.sqrt(sum((c - p) ** 2 for c, p in zip(
-                        info.board_color_left, self.reference_board_color_left))) > self.thresh.board_color_change:
+                        info.board_color_left, self.reference_board_color_left))) > self.threshold_config.board_color_change:
                     self.board_changed_seen_during_stall = True
             if info.board_color_right and self.reference_board_color_right:
                 if np.sqrt(sum((c - p) ** 2 for c, p in zip(
-                        info.board_color_right, self.reference_board_color_right))) > self.thresh.board_color_change:
+                        info.board_color_right, self.reference_board_color_right))) > self.threshold_config.board_color_change:
                     self.board_changed_seen_during_stall = True
 
-            if self.timer_stall_count >= self.thresh.timer_pause_frames:
+            if self.timer_stall_count_frame >= self.threshold_config.timer_pause_frames:
                 self.state = State.TIMER_STALLED
                 logger.debug(f"[幀 {info.frame_number}] 計時器停頓大於設定閾值，進入判定")
                 return self.timer_stalled(info)
@@ -1133,14 +1083,12 @@ class RoundDetector:
         if info.timer_value is None:
             return None
         if self.timer_stall_start_frame != 0:
-            self.timer_stall_count = info.frame_number - self.timer_stall_start_frame
-        # 可以知道這段暫停到底持續了多久 timer_stall_count
+            self.timer_stall_count_frame = info.frame_number - self.timer_stall_start_frame
+        # 可以知道這段暫停到底持續了多久 timer_stall_count_frame
 
         score_left = info.score_left if info.score_left is not None else self.last_known_score[0]
         score_right = info.score_right if info.score_right is not None else self.last_known_score[1]
 
-
-        #light_on = info.light_left or info.light_right # 原本
         effective_light_left = info.light_left or self.light_seen_during_stall_left
         effective_light_right = info.light_right or self.light_seen_during_stall_right
         light_on = effective_light_left or effective_light_right
@@ -1151,19 +1099,19 @@ class RoundDetector:
         if info.board_color_left and self.reference_board_color_left:
             diff_l = np.sqrt(sum((c - p) ** 2 for c, p in zip(
                 info.board_color_left, self.reference_board_color_left)))
-            board_color_changed_left = diff_l > self.thresh.board_color_change
+            board_color_changed_left = diff_l > self.threshold_config.board_color_change
 
         if info.board_color_right and self.reference_board_color_right:
             diff_r = np.sqrt(sum((c - p) ** 2 for c, p in zip(
                 info.board_color_right, self.reference_board_color_right)))
-            board_color_changed_right = diff_r > self.thresh.board_color_change
+            board_color_changed_right = diff_r > self.threshold_config.board_color_change
 
         board_color_changed = board_color_changed_left or board_color_changed_right or self.board_changed_seen_during_stall
-        #stall_seconds = self.timer_stall_count / self.fps
 
         # 1. 得分燈亮 ＋ 計分板顏色有明顯變化 + 計時器停頓(且確保是專屬於因為得分而暫停) = 得分交鋒
+        # 20260605 多加一個條件，如果剛好 0.00 得分，也應該要算進來
         if light_on and board_color_changed and (self.prev_timer is None or 
-                                                 info.timer_value == self.prev_timer):
+                                                 info.timer_value == self.prev_timer or info.timer_value == 0.0):
             # 把記憶到的燈號狀態寫回 info,讓 get_point 用到
             info.light_left = effective_light_left
             info.light_right = effective_light_right
@@ -1172,10 +1120,15 @@ class RoundDetector:
  
         # 該局時間到: 以偵測到 0:00 出現在字卡上為準
         if self.is_period_end(info):
-            if self.current_period < 3:
+            if self.current_period_sysself_count < 3:
                 self.after_period_end = True
                 logger.debug(f"[幀 {info.frame_number}] 偵測到 0:00，開啟局間休息忽略模式")
             return self.times_up(info, score_left, score_right)
+        
+        # 出口二:幽靈得分 — 停頓中分數/局數前進但全程沒燈 → 導播剪掉亮燈那段,快速止損
+        if not light_on and self._score_or_period_changed(info):
+            logger.warning(f"[幀 {info.frame_number}] 停頓中偵測到分數/局數前進但無燈號 → 幽靈得分,止損")
+            return self.handle_clip_jump(info)
 
         # 消極比賽
         #三者同時：
@@ -1189,8 +1142,7 @@ class RoundDetector:
         # 另一種可能 暫停太久(其實是消極比賽 只是因為影片關係可能影片看起來並沒有滿一分鐘)，所以原本 60 改成 50 了
         if (self.current_round_timer_start is not None
                 and info.timer_value is not None
-                and (self.current_round_timer_start - info.timer_value) >= self.thresh.passivity_seconds
-                #and stall_seconds >= self.thresh.stall_seconds
+                and (self.current_round_timer_start - info.timer_value) >= self.threshold_config.passivity_seconds
                 and not light_on):
             logger.debug(
                 f"[幀 {info.frame_number}] 消極判定觸發: "
@@ -1209,8 +1161,8 @@ class RoundDetector:
                 )
                 self.pause_start_and_end.append((self.timer_stall_start_frame, info.frame_number))
 
-            self.state = State.IN_ROUND
-            self.timer_stall_count = 0
+            self.state = State.IN_ROUND # 先提前預訂好 in_round 然後等等繼續播影片(取消暫停)的資料備齊
+            self.timer_stall_count_frame = 0
             self.timer_stall_start_frame = info.frame_number
             self.prev_timer = info.timer_value
             return None
@@ -1224,17 +1176,16 @@ class RoundDetector:
         if self.after_period_end:
             # 只有看到接近 3:00 且 period 有更新時才解除
             if info.timer_value is not None and \
-                            info.timer_value >= 175.0 and self.last_seen_period is not None \
+                            info.timer_value >= 175.0 and self.last_known_period is not None \
                                             and info.period is not None \
-                                            and info.period > self.last_seen_period:
+                                            and info.period > self.last_known_period:
                 self.after_period_end = False
-                self.last_seen_period = info.period
+                self.last_known_period = info.period
 
                 logger.info(f"[幀 {info.frame_number}] 局間休息模式解除，進入第 {info.period} 局")
 
                 self.state = State.WAITING_FOR_START
                 self.prev_timer = info.timer_value
-                #self.begin_round(info)
         return None
 
 
@@ -1243,8 +1194,8 @@ class RoundDetector:
 
         # 記錄新回合的起始狀態
         if info.period is not None:
-            self.current_period = info.period
-            self.last_seen_period = info.period
+            self.current_period_sysself_count = info.period
+            self.last_known_period = info.period
 
         self.round_count += 1
         self.current_round_start_frame = info.frame_number
@@ -1260,11 +1211,11 @@ class RoundDetector:
                 f"真實有效回合的開始秒數 ={self.current_round_timer_start}"
             )
 
-        self.prev_round_score = [
+        self.score_when_round_open = [
             info.score_left if info.score_left is not None else self.last_known_score[0],
             info.score_right if info.score_right is not None else self.last_known_score[1],
         ]
-        self.last_known_score = list(self.prev_round_score)   
+        self.last_known_score = list(self.score_when_round_open)   
 
         # 記錄本回合的 board_color 固定基準
         self.reference_board_color_left = None
@@ -1272,12 +1223,12 @@ class RoundDetector:
 
         self.pause_start_and_end = []
         self.state = State.IN_ROUND
-        self.timer_stall_count = 0
+        self.timer_stall_count_frame = 0
         self.timer_stall_start_frame = info.frame_number
         logger.info(
             f"[幀 {info.frame_number}] === 回合 {self.round_count} 開始 === "
-            f"局={self.current_period}, 計時器={self.format_timer(info.timer_value)}, "
-            f"比分={self.prev_round_score}"
+            f"局={self.current_period_sysself_count}, 計時器={self.format_timer(info.timer_value)}, "
+            f"比分={self.score_when_round_open}"
         )
 
         if (self.reference_board_color_left is None
@@ -1317,14 +1268,13 @@ class RoundDetector:
             last.score_invalidated = True
             last.is_disputed = True
             last.dispute_type = "void"
-            last.details = (
-                (last.details + " | " if last.details else "")
-                + f"假回合修正: 系統判定 {original_after} 但 OCR 觀察分數無變化({ocr_observed}),"
+            last.details.append(
+                f"假回合修正: 系統判定 {original_after} 但 OCR 觀察分數無變化({ocr_observed}),"
                 f"判定為裁判判無效或燈號誤閃,此回合不應計入有效得分"
             )
 
             logger.warning(
-                f"[幀 {info.frame_number}] 假回合修正: 上回合 {last.filename} "
+                f"[幀 {info.frame_number}] 假回合修正: 上回合 {last.filename}, "
                 f"score_after {original_after} → {ocr_observed},將保留消極錨點"
             )
             self.last_record_needs_rewrite = True
@@ -1348,9 +1298,8 @@ class RoundDetector:
             else:
                 actual = "無人(分數倒退?)"
             
-            last.details = (
-                (last.details + " | " if last.details else "")
-                + f"得分方修正: 系統判定 {last.winner} 得分 → 實際為 {actual} 得分,"
+            last.details.append(
+                f"得分方修正: 系統判定 {last.winner} 得分 → 實際為 {actual} 得分,"
                 f"分數 {original_after} → {ocr_observed}"
             )
             logger.warning(
@@ -1366,8 +1315,8 @@ class RoundDetector:
 
         # 切出該回合影片。記錄亮燈結果與獲勝方（左 / 右 / 雙方）。no_score_added_count 歸零
 
-        sl = self.prev_round_score[0]
-        sr = self.prev_round_score[1]
+        sl = self.score_when_round_open[0]
+        sr = self.score_when_round_open[1]
 
         if info.light_left and info.light_right:
             winner = "both"
@@ -1389,10 +1338,8 @@ class RoundDetector:
         self.last_known_score = [sl, sr]
 
         record = self.create_round_record(info, sl, sr, winner, end_type)
-        self.prev_round_score = [sl, sr]
-        #self.no_score_added_count_before_last_round = self.no_score_added_count  # 備份
+        self.score_when_round_open = [sl, sr]
         self.no_score_added_count = 0.0
-        # ★ 新增:得分判定已完成,清除停頓燈號記憶 ★
         # 這次得分已經「用掉」了亮燈事件,旗標的任務結束。
         # 若不清,當 timer 卡死不動時(in_round 第 1073 行的歸零永遠觸發不了),
         # 殘留的 True 會在下一次停頓判定時被當成幽靈燈,再次誤判得分。
@@ -1403,7 +1350,7 @@ class RoundDetector:
         # 附帶檢查 — 是否為整場比賽結束
         self.check_match_end(record, sl, sr)
          # 新增:0:00 壓哨得分的特殊處理
-        if info.timer_value == 0.0:
+        if info.timer_value == 0.0 and self.state != State.MATCH_ENDED: # 都打完了不用甚麼局間休息了
             self.after_period_end = True
             logger.debug(f"[幀 {info.frame_number}] 偵測到 0:00，開啟局間休息忽略模式")
 
@@ -1421,8 +1368,8 @@ class RoundDetector:
                               score_right: Optional[int]) -> RoundRecord:
        
 
-        sl = score_left if score_left is not None else self.prev_round_score[0]
-        sr = score_right if score_right is not None else self.prev_round_score[1]
+        sl = score_left if score_left is not None else self.score_when_round_open[0]
+        sr = score_right if score_right is not None else self.score_when_round_open[1]
 
         record = self.create_round_record(info, sl, sr, "none", "period_end")
 
@@ -1431,26 +1378,17 @@ class RoundDetector:
 
         logger.info(
             f"[幀 {info.frame_number}] === 回合 {self.round_count} 結束 === "
-            f"類型=period_end, 局={self.current_period} 時間到, 比分=[{sl}, {sr}]"
+            f"類型=period_end, 局={self.current_period_sysself_count} 時間到, 比分=[{sl}, {sr}]"
         )
 
-        """
-        # 判斷是否進入延長賽或等待下一局
-        if not record.match_end:
-            if self.current_period == 3 and sl == sr:
-                # 「3/3 局結束時雙方平手，且計時器重置為 1:00 附近開始倒數。」
-                logger.info("3/3 局結束平手，進入延長賽等待")
-            self.state = State.WAITING_FOR_NEW_PERIOD
-        
-        """
         self.finalize_round(record, info)
         return record
 
     def end_round_passivity(self, info: FrameInfo,
                              score_left: Optional[int],
                              score_right: Optional[int]) -> RoundRecord:
-        sl = score_left if score_left is not None else self.prev_round_score[0]
-        sr = score_right if score_right is not None else self.prev_round_score[1]
+        sl = score_left if score_left is not None else self.score_when_round_open[0]
+        sr = score_right if score_right is not None else self.score_when_round_open[1]
 
         self.passivity_count += 1
 
@@ -1479,11 +1417,10 @@ class RoundDetector:
                              score_left: int, score_right: int,
                              winner: str, end_type: str) -> RoundRecord:
         filename = f"test{self.round_count:03d}"
-        #is_bonus_match = self.current_period == 4
 
         record = RoundRecord(
             filename=filename,
-            period=self.current_period,
+            period=self.current_period_sysself_count, # 自己計算的 PERIOD 
             round_number=self.round_count,
             time_startStamp_for_MAMA=self.format_timestamp(self.current_round_start_time),
             time_endStamp_for_MAMA=self.format_timestamp(info.timestamp),
@@ -1491,31 +1428,28 @@ class RoundDetector:
             end_frame=info.frame_number,
             timer_start=self.format_timer(self.current_round_timer_start),
             timer_end=self.format_timer(info.timer_value),
-            score_before=list(self.prev_round_score),
+            score_before=list(self.score_when_round_open),
             score_after=[score_left, score_right],
             winner=winner,
             end_type=end_type,
-            #bonus_match=is_bonus_match,
-            #gap_before=self.gap_pending,
+            pause_segments=list(self.pause_start_and_end),
         )
         return record
 
     def finalize_round(self, record: RoundRecord, info: Optional[FrameInfo] = None):
         self.rounds.append(record)
-        self.timer_stall_count = 0
+        self.timer_stall_count_frame = 0
         self.timer_stall_start_frame = 0 #反正局都已經
-
-        # 新增:只有「得分類」結束才記錄得分幀號,供 waiting_for_start 擋導播遲滯用(先不用 我後來把暫停時間改成 45 幀了)
-        #if record.end_type in ("win", "double_win") and info is not None:
-        #   self.last_score_frame = info.frame_number
 
         # too_late_to_win = float(record.timer_end.replace(":", ".")) # 這個先不要用到，相信裁判不會直接沒剩幾秒就切
         if record.match_end: # 全打完了
             self.state = State.MATCH_ENDED
-        elif record.end_type == "period_end" or record.timer_end == "0.00": # 這局結束了 這裡是字串
-            # 這裡感覺要注意 不知道 timer_end 是否可以正確變成 0.00 也有可能長得像 0:00, 000 要看 ocr 怎麼辨識。
+        elif record.end_type == "period_end" or record.timer_end == "0.00" or record.timer_end == "0:00"\
+                                                                             or record.timer_end == "000": # 這局結束了 這裡是字串
+            # 這裡感覺要注意 不知道 timer_end 是否可以正確變成 0.00 也有可能長得像 0:00, 000 要看 ocr 怎麼辨識(2026/06/04 改好了)。
             self.state = State.WAITING_FOR_NEW_PERIOD
             self.last_known_timer = 180 
+            self.after_period_end = True # 20260605 半夜改的
             # 原本是 none 現在提前更新給下一局的 開始時間用，這樣parse_time 那裏才不會判斷錯誤
             self.prev_timer = None
         else: # 局內回合結束，準備下回合
@@ -1551,8 +1485,9 @@ class RoundDetector:
                 return
 
         # 條件 2：時間到、比分領先
-        is_period_3_end = (self.current_period == 3 and 
-                           (record.end_type == "period_end" or record.timer_end == "0.00"))
+        is_period_3_end = (self.current_period_sysself_count == 3 and 
+                           (record.end_type == "period_end" or record.timer_end == "0.00" or record.timer_end == "0:00"\
+                                                                             or record.timer_end == "000"))
 
         if is_period_3_end:
             if score_left != score_right:
@@ -1575,54 +1510,229 @@ class RoundDetector:
                 )
                 self.state = State.MATCH_ENDED
                 logger.warning(
-                    f"★★★ 第 3 局結束時比分平手 {score_left}:{score_right},需要延長賽。"
-                    f"目前系統不支援延長賽,將中止處理。"
-                )
-                logger.warning(
-                    f"★★★ 建議:手動編輯後續延長賽片段,或等待系統未來支援。 \
+                    f"建議手動編輯後續延長賽片段,或等待系統未來支援延長賽部分。 \
                     被你發現偷懶的地方了 ciallo (∠·ω )⌒★ "
                 )
                 return
-       
-    def _detect_clip_jump(self, info: FrameInfo) -> Tuple[bool, bool]:
-        """
-        回傳 (is_real_clip_jump, should_update_timer)
-        - is_real_clip_jump: True 表示真的是影片剪輯跳變，要呼叫 handle_clip_jump
-        - should_update_timer: False 表示這幀 OCR 壞掉，不要更新 last_known_timer
-        """
-        # 只在「回合進行中」才偵測剪輯跳變
-        # WAITING_FOR_START / WAITING_FOR_NEW_PERIOD 期間 timer 可能正常重置,不適用
-        if self.state != State.IN_ROUND:
-            return False, True
     
-        """偵測影片被剪輯的跳變：UI 持續顯示，但 timer 突然大幅減少 + score/period 有變化"""
-        
+    def _score_or_period_changed(self, info: FrameInfo) -> bool:
+        """分數或局數相對 last_known 有「前進」(分數局數只進不退)→ 代表中間發生了得分/換局。"""
+        sl, sr = self.last_known_score[0], self.last_known_score[1]
+        if info.score_left is not None and sl is not None and info.score_left > sl:
+            return True
+        if info.score_right is not None and sr is not None and info.score_right > sr:
+            return True
+        if info.period is not None and self.last_known_period is not None and info.period > self.last_known_period:
+            return True
+        return False
+
+    def _clear_timer_pending(self):
+        self.timer_pending = False
+        self.timer_pending_base = None
+        self.timer_pending_value = None
+        self.timer_pending_n = 0
+
+    def _timer_gatekeeper(self, info: FrameInfo):
+        """
+        時間軌跡守門:取代舊的鋼講過的那個。
+        只用時鐘物理速率這一個常數,其餘靠軌跡走向。
+        回傳 (status, record):
+        "pass" 時間合法或已裁決，放行正常處理
+        "freeze" 異常掛起觀察中，本幀凍結,呼叫端 return None
+        "clip" 確認剪輯且有得分/換局，已止損(record=新回合切點)
+        """
         if info.timer_value is None or self.last_known_timer is None:
-            return False, True
+            return "pass", None
 
-        timer_drop = abs(self.last_known_timer - info.timer_value)
+        # 在影片逐幀 OCR 辨識計時器（timer）的過程中，偵測「時間斷層」（timer 大幅跳回)
+        # 並區分「真正的影片剪輯跳變」與「暫時性的 OCR 誤讀」。
+        dt = (self.sample_interval / self.fps) if self.fps > 0 else 0.5 # 通常應該是 0.5 秒
+        max_drop = math.ceil(dt) + 1.0   # 每 sample 合理最大跌幅(物理速率+裕度) # 現在應該會是 2
+        rise_eps = 0.5                   # 吸收整數/小數邊界浮點抖動;回合中不該往上加時間
 
-        # 基本條件：時間突然少了超過門檻（不是正常倒數或停頓）
-        if timer_drop <= self.thresh.clip_jump_timer_delta:
-            return False, True
+        # 第一次
+        if not self.timer_pending:
+            on_track = (self.last_known_timer - max_drop) <= info.timer_value <= (self.last_known_timer + rise_eps)
+            # 上一次正確的時間 - max_drop ～ 上一次正確的時間 + 0.5
+            if on_track:
+                return "pass", None # 代表是正常的倒數
+            
+            # 出現斷層。捷徑:分數/局數前進 = 中間真的得分/換局 = 真剪輯,不用等
+            if self._score_or_period_changed(info):
+                logger.warning(f"[幀 {info.frame_number}] 時間斷層 "
+                            f"{self.format_timer(self.last_known_timer)}→{self.format_timer(info.timer_value)} 且分數/局數前進 "
+                            f"→ 直接判定剪輯跳變,止損")
+                return "clip", self.handle_clip_jump(info)
+            
+            # 無語意佐證，看後面幾幀是回彈(誤讀)還是續跌(剪輯)
+            self.timer_pending = True
+            self.timer_pending_base = self.last_known_timer
+            self.timer_pending_value = info.timer_value
+            self.timer_pending_n = 0
+            logger.debug(f"[幀 {info.frame_number}] 時間斷層 "
+                        f"{self.format_timer(self.last_known_timer)}→{self.format_timer(info.timer_value)},"
+                        f"先觀察幾幀再決定剪輯 vs 誤讀")
+            info.timer_value = self.last_known_timer
+            return "freeze", None
 
-        # 輔助條件：score 或 period 至少有一個變化（避免 OCR 小抖動誤判）
-        score_or_period_changed = False
-        if info.score_left is not None and self.last_known_score[0] is not None:
-            score_or_period_changed = score_or_period_changed or (info.score_left != self.last_known_score[0])
-        if info.score_right is not None and self.last_known_score[1] is not None:
-            score_or_period_changed = score_or_period_changed or (info.score_right != self.last_known_score[1])
-        if info.period is not None and self.last_seen_period is not None:
-            score_or_period_changed = score_or_period_changed or (info.period != self.last_seen_period)
+        # ── pending 中,用這一幀裁決 ──
+        self.timer_pending_n += 1
 
-        if not score_or_period_changed:
-            logger.debug(f"[幀 {info.frame_number}] timer 跳了 {timer_drop:.1f} 秒，但 score/period 無變化，應該是誤讀，所以忽略")
-            return False, False
+        if self._score_or_period_changed(info):
+            logger.warning(f"[幀 {info.frame_number}] 觀察期內分數/局數前進 → 確認剪輯跳變，止損")
+            self._clear_timer_pending()
+            return "clip", self.handle_clip_jump(info)
 
-        logger.warning(f"[幀 {info.frame_number}] ★★★ 偵測到影片剪輯跳變！timer \
-                       從 {self.format_timer(self.last_known_timer)} 跳到 {self.format_timer(info.timer_value)}")
-        return True, True
-    
+        snap_back    = (self.timer_pending_base - self.timer_pending_n * max_drop) <= info.timer_value <= (self.timer_pending_base + rise_eps)  # 回到舊軌跡 → OCR 雜訊
+        continue_new = (self.timer_pending_value - self.timer_pending_n * max_drop) <= info.timer_value <= (self.timer_pending_value + rise_eps)  # 續著新值倒數 → 真剪輯
+
+        if snap_back and not continue_new:
+            logger.debug(f"[幀 {info.frame_number}] 觀察 {self.timer_pending_n} 幀後回到舊軌跡 → 判定 OCR 雜訊，丟棄斷層")
+            self._clear_timer_pending()
+            return "pass", None
+
+        if continue_new and not snap_back:
+            # 新軌跡成立,但全程沒人得分 = 純時間剪輯(垃圾時間),不開假回合,只重設基準,同回合續跑
+            logger.warning(f"[幀 {info.frame_number}] 觀察 {self.timer_pending_n} 幀後續著新值倒數且無得分 → "
+                        f"純時間剪輯，重設基準 {self.format_timer(self.timer_pending_base)}→{self.format_timer(info.timer_value)}，同回合繼續")
+            self._clear_timer_pending()
+            return "pass", None
+
+        if self.timer_pending_n >= 3:
+            logger.debug(f"[幀 {info.frame_number}] 觀察 3 幀仍判不出來,保守當雜訊,維持舊軌跡")
+            self._clear_timer_pending()
+            info.timer_value = self.timer_pending_base
+            return "pass", None
+
+        info.timer_value = self.timer_pending_base
+        return "freeze", None
+
+    def _infer_situ(self, info: FrameInfo, last_known_score, period_changed: bool, score_changed: bool) -> dict:
+        """
+        B/C/D 共用:字卡重現且分數/局數有變時,推測是否為消極、第幾次。
+        判定成立時在此更新 self.passivity_count(單一管理點)。
+        """
+        # UI 消失時長(復用原本沒人讀的 self.ui_disappeared_frame)+ 先前累積無得分
+        ui_gone_how_long = 0.0 # 單位 秒
+        if self.ui_disappeared_frame:
+            ui_gone_how_long = max(0.0, (info.frame_number - self.ui_disappeared_frame) / self.fps)
+            #  先用 disa_count 表示說這段消失的秒數
+        disa_count = self.no_score_added_count + ui_gone_how_long if ui_gone_how_long is not None else 0
+
+        last_score_left, last_score_right = last_known_score[0] or 0, last_known_score[1] or 0
+        curr_score_left, curr_score_right = info.score_left or 0, info.score_right or 0
+
+        l = abs(curr_score_left - last_score_left) 
+        r = abs(curr_score_right - last_score_right)
+        if l >=2 or r >=2:
+            return dict(is_passivity=False, end_type="multi_round_so_skip",
+                        dispute_type="multi_round_so_skip",
+                        winner=("left" if l > r else "right"  if r > l else "none"),
+                        details=[f"分數跳變 [{last_score_left},{last_score_right}]→[{curr_score_left},{curr_score_right}],"
+                                 f"單邊增加≥2,可能跳過多回合,_infer_situ 不適用"])
+        
+        both_plus_one = (curr_score_left == last_score_left + 1) and (curr_score_right == last_score_right + 1)
+        details = [
+            f"UI消失到出現總共歷時: {ui_gone_how_long:.1f}s",
+            f"分數 [{last_score_left},{last_score_right}] → [{curr_score_left},{curr_score_right}],局變={period_changed}",
+        ]
+        # 規則1:局變、分變
+        # 雙方各+1 + 接近門檻 + 已經有一次消極 = 這次第2次消極
+        if period_changed and score_changed: 
+            if both_plus_one: # 兩邊得分
+                if disa_count > 60: # 有達到消極的標準
+                    if self.passivity_count >= 1: # 已經有一次消極比賽了(這次可能第二次) 
+                        # 非常有可能是消極比賽(當然還是用猜的)
+                        self.passivity_count += 1
+                        note = f"上一局的上個回合，雙方各+1分，推測此次為第 {self.passivity_count} 次消極(雙方各得1分)，\
+                                    注意這只是用推論的可能會錯，因為這時候 UI 不見了"
+                        details.append(note)
+                        return dict(is_passivity=True, end_type="passivity",
+                                    dispute_type="passivity2_guess", winner="none", details=details)
+                    
+                    else: # 還沒有消極過，但是時間是有達標的，但是又因為雙邊得分，所以應該是真的 double
+                        note = f"上一局的上個回合雙方都有+1分，但是消極次數還不到第二次，且這次又有人得分，應該是真的得分\
+                                    注意這只是用推論的可能會錯，因為這時候 UI 不見了"
+                        details.append(note)
+                        return dict(is_passivity=False, end_type="double_win",
+                                dispute_type="double_win_guess", winner="both", details=details)
+                    
+                else: # 到計時累積不夠又因為兩邊都得分，所以判斷雙燈
+                    note = f"上一局的上個回合雙方都有加分，但是消極比賽時間甚至還沒達標，且這次又有人得分，應該是真的得分\
+                                    注意這只是用推論的可能會錯，因為這時候 UI 不見了"
+                    details.append(note)
+                    return dict(is_passivity=False, end_type="double_win",
+                                dispute_type="double_win_guess", winner="both", details=details)
+                
+            else: # 只有一邊得分，消極比賽通常兩邊都一起加分，所以這個應該是單方有人得分
+                note = f"上一局的上個回合，有一方+1，沒有達標消極時間，應該是真的得分\
+                                    注意這只是用推論的可能會錯，因為這時候 UI 不見了"
+                details.append(note)
+                return dict(is_passivity=False, end_type="win",
+                                    dispute_type="sb_got_point_guess", winner = "left" if curr_score_left > last_score_left \
+                                                                                else "right", details=details)
+
+
+        # 規則2:局變、分不變
+        # 既然分數不變，代表有可能是第一次消極，或是剛好時間到結束(沒有達標消極比賽時間)
+        elif period_changed and not score_changed: 
+            if disa_count > 60 and self.passivity_count == 0: 
+                self.passivity_count += 1
+                # 我這邊忽略了一個條件，如果說已經有一次消極比賽了，但這次時間又達標準，可是沒有加分，那我目前的方法是一樣先忽略
+                # 這種現象，一律判定為沒有消極，還沒設想到那種情形。
+                note = f"上一局的上個回合，雙方雖沒加分但是時間有達標，推測此次為第 {self.passivity_count} 次消極，\
+                                    注意這只是用推論的可能會錯，因為這時候 UI 不見了"
+                details.append(note)
+                return dict(is_passivity=True, end_type="passivity",
+                                    dispute_type="passivity1_guess", winner="none", details=details)
+            
+            else: 
+            # 沒達標 或 已消極過= 一律當正常局結束
+                note = f"上一局的上個回合，雙方沒加分時間也沒有達標，推測此次為一般局結束(0:00)，\
+                                    注意這只是用推論的可能會錯，因為這時候 UI 不見了"
+                details.append(note)
+                return dict(is_passivity=False, end_type="period_end",
+                                    dispute_type="period_end_guess", winner="none", details=details)
+        
+        # 規則3 局不變 分變
+        elif not period_changed and score_changed:
+            # 局內自己的分數變化，這邊標準放低，因為前面都是局有改變，通常局間會有休息時間，影片也不會去剪掉，所以前面才設定 60s
+            # 這邊是局內自己的 應該可以稍微輕鬆點
+            if both_plus_one: # 兩邊得分
+                if disa_count >= 55: # 有達到消極的標準
+                    if self.passivity_count >= 1: # 已經有一次消極比賽了(這次可能第二次) 
+                        # 非常有可能是消極比賽(當然還是用猜的)
+                        note = f"局內有出現 UI 消失且分數在這過程中有變化的現象，且消極時間有達標\
+                                ，雙方各+1分，並且推測此次為第 {self.passivity_count +1 } 次消極(雙方各得1分)，\
+                                    注意這只是用推論的可能會錯，因為這時候 UI 不見了"
+                        self.passivity_count += 1
+                        details.append(note)
+                        return dict(is_passivity=True, end_type="passivity",
+                                    dispute_type="passivity2_guess", winner="none", details=details)
+                    
+                    else: # 還沒有消極過，但是時間是有達標的，但是又因為雙邊得分，所以應該是真的 double
+                        note = f"局內有出現 UI 消失且分數在這過程中有變化的現象，且消極時間有達標，同時又是第一次消極，\
+                                    注意這只是用推論的可能會錯，因為這時候 UI 不見了"
+                        details.append(note)
+                        return dict(is_passivity=False, end_type="double_win",
+                                dispute_type="double_win_guess", winner="both", details=details)
+                    
+                else: # 到計時累積不夠又因為兩邊都得分，所以判斷雙燈
+                    note = f"局內雙方都有加分，但是消極比賽時間甚至還沒達標，且這次又有人得分，應該是真的得分\
+                                    注意這只是用推論的可能會錯，因為這時候 UI 不見了"
+                    details.append(note)
+                    return dict(is_passivity=False, end_type="double_win",
+                                dispute_type="double_win_guess", winner="both", details=details)
+                
+            else: # 只有一邊得分，消極比賽通常兩邊都一起加分，所以這個應該是單方有人得分
+                note = f"這次有一方+1，沒有達標消極時間，應該是真的得分\
+                                    注意這只是用推論的可能會錯，因為這時候 UI 不見了"
+                details.append(note)
+                return dict(is_passivity=False, end_type="win",
+                                    dispute_type="sb_got_point_guess", winner = "left" if curr_score_left > last_score_left \
+                                                                            else "right", details=details)
+            
+
 
     # 字卡剛剛不見，現在又出現
     # 這邊記得問 cluade 暫停的事 如果切回來剛好發生停頓，那會如何
@@ -1636,87 +1746,92 @@ class RoundDetector:
          根據分數差值推算得分次數
         """
         logger.debug(f"[幀 {info.frame_number}] UI 字卡重新出現")
-        current_score = [info.score_left, info.score_right] # ocr 讀到的比分
 
-        if current_score[0] is None:
-            current_score[0] = self.last_known_score[0]
-        if current_score[1] is None:
-            current_score[1] = self.last_known_score[1]
+        if info.score_left is None:
+            info.score_left = self.last_known_score[0] if self.last_known_score[0] is not None else 0
+        if info.score_right is None:
+            info.score_right = self.last_known_score[1] if self.last_known_score[1] is not None else 0
         
         period_changed = False
-        if info.period is not None and self.current_period is not None:
-            if info.period != self.current_period:
+        # current_period_sysself_count 系統自己去計算的局數紀錄次數
+        if info.period is not None and self.current_period_sysself_count is not None:
+            if info.period != self.current_period_sysself_count: # 發現 局的 ocr 和自己紀錄的過去的不一樣
                 period_changed = True
+
+        score_changed = False # 任一邊有分數變化
+        if (info.score_left is not None and self.last_known_score[0] is not None and \
+            info.score_left != self.last_known_score[0]) or \
+                (info.score_right is not None and self.last_known_score[1] is not None and  
+                                            info.score_right != self.last_known_score[1]):
+            score_changed = True
 
         """ 如果 ui 消失且 局數已經變了 那就趕快先取現在的時間點
         (比如目前 frame 然後趕緊總結回合，再趕快回來去做新回合的作業)"""
-        # 更 很好我還是做了
         # 情況 A：分數未變 also 局數也沒變
-        if not period_changed and (
-                (self.last_known_score[0] is None and self.last_known_score[1] is None) or 
-                (current_score[0] == self.last_known_score[0] and current_score[1] == self.last_known_score[1])):
-            
-            # 安全，加入消極計時
+        if not period_changed and not score_changed:
+            # 安全，加入消極計時 20260605 改掉了，因為 begin_round 本身就會算了
+            """
             if self.last_known_timer is not None and info.timer_value is not None:
                 gap_time = abs(self.last_known_timer - info.timer_value)
                 if gap_time > 0:
-                    self.no_score_added_count += gap_time
+                    self.no_score_added_count += gap_time"""
             logger.debug("  分數未變，無縫接回")
             return None
 
-        # 情況 B：分數變了
+        # 有個額外的想法，我現在有推論的因素在，所以不一定會正確，我可以去時做一個攜帶性的判斷，比如說我這次假設他是消極比賽第一次，
+        #但是如果我下次用真實的 ui 去辨識出來是消極，但是卻沒有加分(這次是第二次)，那就代表第一次，就是我現在這次推論錯誤。
+        # 類似這樣的情況，要往回修正我的 json，系統將會變更複雜 但是會更強健，還有一種可能性是兩次都是用這種 ui 消失時推論的，那那種情況就要看
+        # 簡單判定，還是一樣設計更複雜的思路
+
+        # 情況 B/C/D:局或分數有變 先清洗、再推測、再止損切割
         if period_changed:
-            logger.warning(f"  字卡消失期間局數從 {self.current_period} 變為 {info.period}，準備跨局結算")
-        logger.warning(f"  字卡消失前的分數: {self.last_known_score}，重新出現的分數: {current_score}")
+            logger.warning(f"  字卡消失期間局數有變 {self.current_period_sysself_count} → 重現時局數 {info.period}")
+        else: logger.warning(f"  字卡消失期間局數沒變")
 
-        sl = current_score[0] if current_score[0] is not None else 0
-        sr = current_score[1] if current_score[1] is not None else 0
-        prev_l = self.last_known_score[0] or 0
-        prev_r = self.last_known_score[1] or 0
+        if score_changed: 
+            logger.warning(f"  字卡消失前分數 {self.last_known_score} → 重現時分數 {info.score_left, info.score_right}")
+        else: logger.warning(f"  字卡消失期間分數沒變")
 
-        original_sl, original_sr = sl, sr
-        modified = False
+        prev_l_s = self.last_known_score[0] or 0
+        prev_r_s = self.last_known_score[1] or 0
 
-        # 這邊是我準備的防呆，以免說 ocr 又亂讀取
-        #注意 這邊的方法是如果讀到的分數不太對，那就強制改回原本的分數，
-        # 但是不排除在字卡消失期間有得 >=2 分，所以這邊是在賭 ocr 實力怎麼樣。
-        if sl - prev_l >= 5 or sl < prev_l: # 如果現在讀到的分數和上一幀的差太多
-            logger.info(f"  [防呆] 左比分異常 ({prev_l} -> {sl})，強制修正回 {prev_l}")
-            sl = prev_l
-            modified = True
-        if sr - prev_r >= 5 or sr < prev_r:
-            logger.info(f"  [防呆] 右比分異常 ({prev_r} → {sr})，強制修正回 {prev_r}")
-            sr = prev_r
-            modified = True
-        
-        if modified:
-            logger.info(f"  [最終採用] 分數已從原始誤讀 {original_sl, original_sr} 修改為 [{sl}, {sr}]")
-        else:
-            logger.info(f"  [防呆] 分數變化在合理範圍，直接採用: [{sl}, {sr}]")
-    
-        info.score_left = sl
-        info.score_right = sr
+        # 防呆:倒退或暴增(>=5)當 OCR 亂讀,清回上次可信值(+1 不會被誤殺)
+        if info.score_left - prev_l_s >= 5 or info.score_left < prev_l_s:
+            logger.info(f"  [防呆] 左比分異常 ({prev_l_s} → {info.score_left})，修正回 {prev_l_s}")
+            info.score_left = prev_l_s
+        if info.score_right - prev_r_s >= 5 or info.score_right < prev_r_s:
+            logger.info(f"  [防呆] 右比分異常 ({prev_r_s} → {info.score_right})，修正回 {prev_r_s}")
+            info.score_right = prev_r_s
 
-        # last_known_score = 現在比分板上應該顯示的分數（smaple_interval 幀更新，）。
-        # prev_round_score = 這一回合剛開始時的比分（用來算這一回合的「得分變化」）。
+
+        # 這個 推測的 func，應該只能適用於 +1 分的場景，如果說 ui 回來後的分數可能 +2, +3 
+        # 代表中間可能跳過很多回合，那應該就不適用於我的這個 func
+        guess = self._infer_situ(info, self.last_known_score, period_changed, score_changed)
+
+        # 止損:B/C/D 一律強制結算舊回合,並把推測資訊寫進 record 供你核對
         record = None
-        # 強制結算舊回合
         if self.state in (State.IN_ROUND, State.TIMER_STALLED):
-            winner = "abnormal"
-            end_type = "ui_reappear"
-            record = self.create_round_record(info, sl, sr, winner, end_type)
-            self.check_match_end(record, sl, sr)
+            record = self.create_round_record(
+                info, info.score_left, info.score_right,
+                guess["winner"], guess["end_type"])
+            record.is_disputed = True                       # 只要是推測就標記
+            record.dispute_type = guess["dispute_type"]
+            record.details.extend(guess["details"])
+            self.check_match_end(record, info.score_left, info.score_right)
             self.finalize_round(record, info)
 
-        self.last_known_score = [sl, sr]
+        # 更新狀態 → 開新回合
+        self.last_known_score = [info.score_left, info.score_right]
         self.last_known_timer = info.timer_value
-        self.prev_timer = info.timer_value
-        #self.prev_round_score = [sl, sr]
+        self.last_known_period = info.period
+        self.prev_timer       = info.timer_value
         self.no_score_added_count = 0.0
-
-        # 然後才開新回合
-        self.begin_round(info)
-        self.prev_round_score = [sl, sr]   
+        if self.state == State.MATCH_ENDED:
+            return record
+        
+        self.begin_round(info) # 後面的 reconcile 不會觸發，因為這裡是 ui 回來且分數或局號有變的時候，所以切的影片也會變成說畫面回來的第一幀
+        # 這沒有辦法 畢竟 ui 消失且東西有變。
+        self.score_when_round_open = [info.score_left, info.score_right] # 這放後面，因為先讓 begin_round 檢查分數對不對
         return record
 
     def handle_clip_jump(self, info: FrameInfo) -> Optional[RoundRecord]:
@@ -1734,22 +1849,22 @@ class RoundDetector:
         prev_r = self.last_known_score[1] or 0
 
         # 2. 防呆修正（OCR 可能亂讀）
-        modified = False
+        # 這邊要注意，仍然是有限制條件去擋著，因為避免說分數被 ocr 誤讀，但是同樣的如果今天的回合
+        # 真的有一個很誇張的分數跳變（比如说直接从 0 跳到 10），那這個防呆機制也會把它擋掉，導致無法正確切割回合，所以這邊的條件要好好拿捏。
+        # 改天再看
         if sl - prev_l >= 5 or sl < prev_l:
             logger.info(f"  [防呆] 左比分異常 ({prev_l} -> {sl})，強制修正回 {prev_l}")
             sl = prev_l
-            modified = True
         if sr - prev_r >= 5 or sr < prev_r:
             logger.info(f"  [防呆] 右比分異常 ({prev_r} → {sr})，強制修正回 {prev_r}")
             sr = prev_r
-            modified = True
 
         info.score_left = sl
         info.score_right = sr
 
         if self.state in (State.IN_ROUND, State.TIMER_STALLED):
             winner = "abnormal"
-            end_type = "clip_jump"          # 新增 end_type 方便你之後 debug
+            end_type = "clip_jump"          # 新增 end_type 方便之後 debug
 
             # 4. 強制結束「舊回合」（使用當前幀作為 end）
             record = self.create_round_record(info, sl, sr, winner, end_type)
@@ -1765,10 +1880,14 @@ class RoundDetector:
         self.last_known_score = [sl, sr]
         self.last_known_timer = info.timer_value
         self.prev_timer = info.timer_value
-        #self.prev_round_score = [sl, sr]
         self.no_score_added_count = 0.0 # 對新回合來說 此回合的分數是新回合的開始分數
+
+        if self.state == State.MATCH_ENDED:
+            logger.debug(f"[幀 {info.frame_number}] 剪輯跳變結算後發現比賽已結束，不再開啟新回合")
+            return record
+        
         self.begin_round(info)
-        self.prev_round_score = [sl, sr]   
+        self.score_when_round_open = [sl, sr]   
 
         # 這邊要注意 如果新回合是消極回合，系統會無法確定，因為我不知道這回合真實的開頭應該是甚麼時候
         logger.debug(f"[幀 {info.frame_number}] 剪輯跳變止損完成，新回合已正確開始")
@@ -1801,7 +1920,7 @@ class RoundDetector:
             
             # 是不是真實的第三局終了?
             is_period3_near_end = (
-                self.current_period == 3
+                self.current_period_sysself_count == 3
                 and self.last_known_timer is not None
                 and self.last_known_timer <= 0.2 # 如果錄影到第 0.5 秒 之前被卡掉
                 and sl < 15 and sr < 15
@@ -1834,7 +1953,7 @@ class RoundDetector:
         is_real_match_end = (
             last_round.period == 3
             and last_round.end_type == "period_end"
-            and remaining_seconds > self.thresh.ui_hasnt_show_up_min
+            and remaining_seconds > self.threshold_config.ui_hasnt_show_up_min
             and sl < 15 and sr < 15
         )
         
@@ -2016,35 +2135,34 @@ class VideoClipper:
         logger.info(f"  json 已儲存: {json_path}")
 
 class MAIN_PIPELINE:
-    def __init__(self, roi_config, threshold_config, video_path=None, 
-             sample_interval=30.00, input_dir=str(INPUT_DIR), output_dir=str(OUTPUT_DIR)):
-        self.video_path = video_path
+    def __init__(self, roi_config, threshold_config, input_video_path=None, 
+             sample_interval=15.00, output_video_path=str(OUTPUT_DIR)):
+        self.input_video_path = input_video_path
         self.roi_config = roi_config
         self.threshold_config = threshold_config
-        self.input_dir = input_dir
-        self.output_dir = output_dir
+        self.output_video_path = output_video_path
         self.sample_interval = sample_interval
 
     def run(self):
-        cap = cv2.VideoCapture(self.video_path)
+        cap = cv2.VideoCapture(self.input_video_path)
         if not cap.isOpened():
-            logger.error(f"無法開啟影片: {self.video_path}")
+            logger.error(f"無法開啟影片: {self.input_video_path}")
             return
 
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
         # 建立輸出目錄
-        match = Path(self.video_path).stem
-        output_match_folder = os.path.join(self.output_dir, match) # 先建立一個資料夾
+        match = Path(self.input_video_path).stem
+        output_match_folder = os.path.join(self.output_video_path, match) # 先建立一個資料夾
         os.makedirs(output_match_folder, exist_ok=True)
 
         # 初始化各元件
-        ui_reader = UICardReader(self.roi_config, self.threshold_config, frame_width, frame_height)
-        detector = RoundDetector(self.threshold_config, fps)
-        clipper = VideoClipper(self.video_path, output_match_folder, fps)
+        ui_reader = UICardReader(self.roi_config, self.threshold_config, frame_w, frame_h)
+        round_detector = RoundDetector(self.threshold_config, fps, self.sample_interval)
+        video_clipper = VideoClipper(self.input_video_path, output_match_folder, fps)
 
         frame_number = 0
         processed_frames = 0
@@ -2055,28 +2173,35 @@ class MAIN_PIPELINE:
 
             if frame_number % self.sample_interval != 0:
                 frame_number += 1
-                continue
+                continue # 每 幾幀取一次 所以中間這些過度的就 跳過  
 
             print(f"\n{'-'*5} [幀 {frame_number} 處理開始]")
-            info = ui_reader.read_frame(frame, frame_number, fps, detector.last_known_timer, 
-                                                                last_period=detector.last_seen_period,
-                                                                prev_ui_visible=detector.prev_ui_visible)
-            record = detector.process_frame(info)
+            """
+                                                self.last_known_timer: Optional[float] = None
+                                                self.last_known_score: List[Optional[int]] = [None, None]
+                                                self.last_known_period: Optional[int] = None 
+                                                self.prev_ui_visible: bool = False
+            """
+            info = ui_reader.read_frame(frame, frame_number, fps, last_known_timer=round_detector.last_known_timer, # 上幀 ui 時間
+                                                                last_known_score=round_detector.last_known_score,
+                                                                last_known_period=round_detector.last_known_period,
+                                                                prev_ui_visible=round_detector.prev_ui_visible)
+            record = round_detector.process_frame(info)
 
             if record is not None:
                 # 切割影片
-                clipper.clip_round(record, detector.pause_start_and_end)
+                video_clipper.clip_round(record, record.pause_segments)
                 # 儲存回合 JSON
-                clipper.save_round_json(record)
+                video_clipper.save_round_json(record)
 
             # 新增: 上一個 record 被校正過 → 重寫它的 JSON
-            if detector.last_record_needs_rewrite:
-                clipper.save_round_json(detector.rounds[-1])
-                detector.last_record_needs_rewrite = False
+            if round_detector.last_record_needs_rewrite:
+                video_clipper.save_round_json(round_detector.rounds[-1])
+                round_detector.last_record_needs_rewrite = False
                 logger.info(f"  上一回合 JSON 已重寫 (因分數校正)")
 
             # 如果比賽結束
-            if detector.state == State.MATCH_ENDED:
+            if round_detector.state == State.MATCH_ENDED:
                 logger.info("=== 整場比賽結束，處理下一部影片或已完成所有影片 ===")
                 break
 
@@ -2085,19 +2210,20 @@ class MAIN_PIPELINE:
 
         cap.release()
 
-        detector.check_implicit_end(total_frames, fps)
+        round_detector.check_implicit_end(total_frames, fps)
         # 強制結算的回合也要切割和存檔
-        for record in detector.rounds:
-            json_path = os.path.join(clipper.output_dir, f"{record.filename}.json")
+        for record in round_detector.rounds:
+            json_path = os.path.join(video_clipper.output_dir, f"{record.filename}.json")
             if not os.path.exists(json_path):  # 只處理還沒存過的
-                clipper.clip_round(record)
-                clipper.save_round_json(record)
+                video_clipper.clip_round(record, record.pause_segments)
+                video_clipper.save_round_json(record)
                 #self._save_match_summary(detector, self.output_dir, fps)
 
-        logger.info(f"處理完成！共 {len(detector.rounds)} 個回合，輸出至 {self.output_dir}")
+        logger.info(f"處理完成！共 {len(round_detector.rounds)} 個回合，輸出至 {self.output_video_path}")
         pass
 
 def get_roi(video_path: str):
+    # 20260529 已閱
     """每個影片獨立一份 ROI 設定，但仍會先詢問使用者是否沿用"""
     video_name = Path(video_path).stem
     config_path = ROI_CONFIG_DIR / f"{video_name}.json"
@@ -2112,8 +2238,9 @@ def get_roi(video_path: str):
 
         if ans == 'y':
             if not has_existing:
-                print(f"  ⚠ [{video_name}] 沒有既有的 ROI 設定可以沿用,請重新選擇")
+                print(f"  [{video_name}] 沒有既有的 ROI 設定可以沿用,請重新選擇")
                 continue  # 重新問
+
             with open(config_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             print(f"已確定使用 {video_name} 的 ROI 設定")
@@ -2128,7 +2255,7 @@ def get_roi(video_path: str):
             break   # 跳出 while,進入下方框選流程
 
         else:
-            print(f"  ⚠ 無效輸入,請輸入 y / n / s")
+            print(f"  無效輸入，請輸入 y / n / s")
             continue   # 重新問
 
     # 進行框選
@@ -2148,7 +2275,6 @@ def customize_roi(video_path):
     cap = cv2.VideoCapture(str(video_path))
     cap.set(cv2.CAP_PROP_POS_FRAMES, FRAME_NUM_TO_EXTRACT_FOR_ROI) 
     ret, frame = cap.read()
-    h, w = frame.shape[:2]
     cap.release()
 
     if not ret or FRAME_NUM_TO_EXTRACT_FOR_ROI is None:
@@ -2168,30 +2294,30 @@ def customize_roi(video_path):
 if __name__ == "__main__":
     thresholds = ThresholdConfig()
     if INPUT_DIR.exists():
-        for video_path in INPUT_DIR.iterdir():
-            if video_path.suffix.lower() in OK_VIDEO_FORMATS:
-                output_match_folder = OUTPUT_DIR / video_path.stem
+        for input_video_path in INPUT_DIR.iterdir():
+            if input_video_path.suffix.lower() in OK_VIDEO_FORMATS:
+                output_match_folder = OUTPUT_DIR / input_video_path.stem
             
                 if output_match_folder.exists():
-                    print(f"跳過 {video_path.name},輸出資料夾已存在: {output_match_folder.name}")
+                    print(f"跳過 {input_video_path.name},輸出資料夾已存在: {output_match_folder.name}")
                     continue
-                current_roi, new = get_roi(video_path)
+                current_roi, new = get_roi(input_video_path)
                 if current_roi is None:
                     # 使用者選擇跳過此影片
-                    print(f"已跳過 {video_path.name}\n")
+                    print(f"已跳過 {input_video_path.name}\n")
                     continue
 
-                print(f">>> 正在處理 {video_path.name}")
+                print(f">>> 正在處理 {input_video_path.name}")
                 pipeline = MAIN_PIPELINE(
                     roi_config=current_roi,
                     threshold_config=thresholds,
-                    video_path=video_path,
+                    input_video_path=input_video_path,
                     sample_interval=15,
                 )
                 pipeline.run()
 
             else:
-                print(f" 跳過非影片檔 {video_path.name}")
+                print(f" 跳過非影片檔 {input_video_path.name}")
     else:
         print(" [比賽前處理] 輸入路徑不存在")
 
