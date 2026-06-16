@@ -106,7 +106,6 @@ class RoundDetector:
         self.rounds: List[RoundRecord] = []
         self.after_period_end: bool = False # 局間回合系統應該要無視這段時間的 ui 資料
         # 這兩個都是為了去準備說 局結束間的1分鐘到計時休息時間 那個不能算回合
-        self.last_record_needs_rewrite: bool = False  # 上一個 record 被校正過,要重寫 JSON
 
         # 字卡
         self.prev_ui_visible: bool = False
@@ -585,6 +584,8 @@ class RoundDetector:
             last.score_invalidated = True
             last.is_disputed = True
             last.dispute_type = "void"
+            if last.filename.startswith("test"):
+                last.filename = "void" + last.filename[len("test"):]
             last.details.append(
                 f"假回合修正: 系統判定 {original_after} 但 OCR 觀察分數無變化({ocr_observed}),"
                 f"判定為裁判判無效或燈號誤閃,此回合不應計入有效得分"
@@ -594,7 +595,6 @@ class RoundDetector:
                 f"[幀 {info.frame_number}] 假回合修正: 上回合 {last.filename}, "
                 f"score_after {original_after} → {ocr_observed},將保留消極錨點"
             )
-            self.last_record_needs_rewrite = True
             
         else:
             # ─── Case A: 誤判得分方(或分數差異) ───
@@ -625,8 +625,7 @@ class RoundDetector:
                 f"分數 {original_after} → {ocr_observed}"
             )
             # 注意: 不還原消極計時,因為真的有人得分,就算判錯邊也算一次有效的得分交鋒
-        
-        self.last_record_needs_rewrite = True
+    
 
     def get_point(self, info: FrameInfo) -> RoundRecord:
 
@@ -715,8 +714,9 @@ class RoundDetector:
             sr += 1
             self.last_known_score = [sl, sr]
             logger.info(f"  [消極比賽] 偵測到第 {self.passivity_count} 次消極，雙方各加一分")
-
-        record = self.create_round_record(info, sl, sr, "none", "passivity")
+            record = self.create_round_record(info, sl, sr, "both", "passivity")
+        else: 
+            record = self.create_round_record(info, sl, sr, "none", "passivity")
         self.check_match_end(record, sl, sr)
 
         # no_score_added_count 歸零
@@ -944,7 +944,7 @@ class RoundDetector:
         if l >=2 or r >=2:
             return dict(is_passivity=False, end_type="multi_round_so_skip",
                         dispute_type="multi_round_so_skip",
-                        winner=("left" if l > r else "right"  if r > l else "none"),
+                        winner=("unKnown"),
                         details=[f"分數跳變 [{last_score_left},{last_score_right}]→[{curr_score_left},{curr_score_right}],"
                                  f"單邊增加≥2,可能跳過多回合,_infer_situ 不適用"])
         
@@ -965,7 +965,7 @@ class RoundDetector:
                                     注意這只是用推論的可能會錯，因為這時候 UI 不見了"
                         details.append(note)
                         return dict(is_passivity=True, end_type="passivity",
-                                    dispute_type="passivity2_guess", winner="none", details=details)
+                                    dispute_type="passivity2_guess", winner="both", details=details)
                     
                     else: # 還沒有消極過，但是時間是有達標的，但是又因為雙邊得分，所以應該是真的 double
                         note = f"上一局的上個回合雙方都有+1分，但是消極次數還不到第二次，且這次又有人得分，應該是真的得分\
@@ -1025,7 +1025,7 @@ class RoundDetector:
                         self.passivity_count += 1
                         details.append(note)
                         return dict(is_passivity=True, end_type="passivity",
-                                    dispute_type="passivity2_guess", winner="none", details=details)
+                                    dispute_type="passivity2_guess", winner="both", details=details)
                     
                     else: # 還沒有消極過，但是時間是有達標的，但是又因為雙邊得分，所以應該是真的 double
                         note = f"局內有出現 UI 消失且分數在這過程中有變化的現象，且消極時間有達標，同時又是第一次消極，\
@@ -1087,11 +1087,6 @@ class RoundDetector:
         # 情況 A：分數未變 also 局數也沒變
         if not period_changed and not score_changed:
             # 安全，加入消極計時 20260605 改掉了，因為 begin_round 本身就會算了
-            """
-            if self.last_known_timer is not None and info.timer_value is not None:
-                gap_time = abs(self.last_known_timer - info.timer_value)
-                if gap_time > 0:
-                    self.no_score_added_count += gap_time"""
             logger.debug("  分數未變，無縫接回")
             return None
 
