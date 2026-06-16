@@ -92,12 +92,14 @@ class MAIN_PIPELINE:
                                                                 last_known_score=round_detector.last_known_score,
                                                                 last_known_period=round_detector.last_known_period,
                                                                 prev_ui_visible=round_detector.prev_ui_visible)
-            record = round_detector.process_frame(info)
+            round_detector.process_frame(info)
+            """
             if record is not None:
                 # 切割影片
                 video_clipper.clip_round(record, record.pause_segments)
                 # 儲存回合 JSON
                 video_clipper.save_round_json(record)
+            """
 
             # 如果比賽結束
             if round_detector.state == State.MATCH_ENDED:
