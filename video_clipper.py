@@ -8,7 +8,20 @@ from process_frame import RoundRecord   # ← 重要
 
 logger = logging.getLogger(__name__)
 
-    
+
+def group_rounds_for_clipping(rounds):
+    """把『void 假回合 + 後續延續回合』歸成同一組。group[-1] 是收尾(通常有效)那回合。"""
+    groups = []
+    buffer = []
+    for r in rounds:
+        buffer.append(r)
+        if r.dispute_type != "void":
+            groups.append(buffer)
+            buffer = []
+    if buffer:
+        groups.append(buffer)
+    return groups
+
 class VideoClipper:
 
     def __init__(self, source_path: str, output_dir: str, fps: float):
@@ -39,6 +52,82 @@ class VideoClipper:
 
         logger.info(f"  影片已切割: {output_path}")
 
+    def clip_round_group(self, records):
+        """
+        一組回合（可能含前面數個 void + 最後一個有效回合）切成一支連貫影片：
+        各回合自己的有效區間都保留，回合與回合之間的非回合空檔自動排除，
+        各回合內部的 pause_segments 也照樣扣掉。以收尾回合命名。
+        """
+        if not records:
+            return None
+        terminer = records[-1]
+        output_path = os.path.join(self.output_dir, f"{terminer.filename}.mp4")
+
+        # 普通回合（沒有 void 牽連）→ 走原本單回合流程
+        if len(records) == 1:
+            self.clip_round(terminer, terminer.pause_segments)
+            return output_path
+
+        # 跨回合蒐集有效片段（frame 為單位）；回合之間的討論/非回合空檔自動被排除
+        active_segments = []
+        for rec in records:
+            prev_end = rec.start_frame
+            for ps, pe in sorted(rec.pause_segments or []):
+                if ps > prev_end:
+                    active_segments.append((prev_end, ps))
+                prev_end = max(prev_end, pe)
+            if prev_end < rec.end_frame:
+                active_segments.append((prev_end, rec.end_frame))
+
+        if not active_segments:
+            logger.warning("  整組沒有有效片段，跳過切割")
+            return None
+
+        # 只有一段直接切
+        if len(active_segments) == 1:
+            s, e = active_segments[0]
+            self._clip_simple(output_path, s / self.fps, e / self.fps)
+            return output_path
+
+        # 多段：分別切再 concat
+        temp_files = []
+        concat_list_path = os.path.join(self.output_dir, "_concat_list.txt")
+        for i, (s, e) in enumerate(active_segments):
+            temp_path = os.path.join(self.output_dir, f"_temp_seg_{i}.mp4")
+            if not self._clip_simple(temp_path, s / self.fps, e / self.fps):
+                for tf in temp_files:
+                    if os.path.exists(tf):
+                        os.remove(tf)
+                logger.error(f"  合併切片失敗，跳過拼接: {terminer.filename}")
+                return None
+            temp_files.append(temp_path)
+
+        with open(concat_list_path, "w") as f:
+            for tf in temp_files:
+                f.write(f"file '{tf}'\n")
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat", "-safe", "0",
+            "-i", concat_list_path,
+            "-c", "copy",
+            output_path,
+        ]
+        try:
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                           check=True, timeout=120)
+        except subprocess.CalledProcessError as e:
+            logger.error(f"ffmpeg 拼接失敗: {e.stderr.decode(errors='ignore')[:300]}")
+        except subprocess.TimeoutExpired:
+            logger.error(f"ffmpeg 拼接 timeout: {terminer.filename}")
+
+        for tf in temp_files:
+            if os.path.exists(tf):
+                os.remove(tf)
+        if os.path.exists(concat_list_path):
+            os.remove(concat_list_path)
+        return output_path
+    
     def _clip_simple(self, output_path: str, start_sec: float, end_sec: float):
         duration = end_sec - start_sec
         cmd = [
