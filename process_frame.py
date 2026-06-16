@@ -26,7 +26,8 @@ class RoundRecord:
     time_startStamp_for_MAMA: str = "00:00:00.00" # 對於原始影片來說取自哪個時間點到哪個時間點
     time_endStamp_for_MAMA: str = "00:00:00.00"    
     start_frame: int = 0           
-    end_frame: int = 0           
+    end_frame: int = 0          
+    stall_start_frame_for_void: int = 0 
     timer_start: str = "0.00" # 影片中局的開始 time
     timer_end: str = "0.00" # 影片中局的結束 time
     score_before: List[int] = field(default_factory=lambda: [0, 0])
@@ -584,6 +585,10 @@ class RoundDetector:
             last.score_invalidated = True
             last.is_disputed = True
             last.dispute_type = "void"
+            if last.stall_frame > 0:
+                last.end_frame = last.stall_frame
+                last.details.append(f"影片切割點已往前修正至時間停頓點 (幀 {last.stall_start_frame_for_void})")
+
             if last.filename.startswith("test"):
                 last.filename = "void" + last.filename[len("test"):]
             last.details.append(
@@ -743,6 +748,7 @@ class RoundDetector:
             time_endStamp_for_MAMA=self.format_timestamp(info.timestamp),
             start_frame=self.current_round_start_frame,
             end_frame=info.frame_number,
+            stall_start_frame_for_void = self.timer_stall_start_frame,
             timer_start=self.format_timer(self.current_round_timer_start),
             timer_end=self.format_timer(info.timer_value),
             score_before=list(self.score_when_round_open),
