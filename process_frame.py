@@ -585,8 +585,8 @@ class RoundDetector:
             last.score_invalidated = True
             last.is_disputed = True
             last.dispute_type = "void"
-            if last.stall_frame > 0:
-                last.end_frame = last.stall_frame
+            if last.stall_start_frame_for_void > 0:
+                last.end_frame = last.stall_start_frame_for_void
                 last.details.append(f"影片切割點已往前修正至時間停頓點 (幀 {last.stall_start_frame_for_void})")
 
             if last.filename.startswith("test"):
