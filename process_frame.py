@@ -740,14 +740,24 @@ class RoundDetector:
                              winner: str, end_type: str) -> RoundRecord:
         filename = f"test{self.round_count:03d}"
 
+        # 將終點強制設定為「進入判定/停頓」的那一刻 
+        normal_end_types = ["win", "double_win", "passivity", "period_end"]
+        if end_type in normal_end_types and self.timer_stall_start_frame > 0:
+            final_end_frame = self.timer_stall_start_frame
+            final_timestamp = self.timer_stall_start_frame / self.fps
+        else:
+            final_end_frame = info.frame_number
+            final_timestamp = info.timestamp
+        # ----------------------------------------------------
+
         record = RoundRecord(
             filename=filename,
             period=self.current_period_sysself_count, # 自己計算的 PERIOD 
             round_number=self.round_count,
             time_startStamp_for_MAMA=self.format_timestamp(self.current_round_start_time),
-            time_endStamp_for_MAMA=self.format_timestamp(info.timestamp),
+            time_endStamp_for_MAMA=self.format_timestamp(final_timestamp),
             start_frame=self.current_round_start_frame,
-            end_frame=info.frame_number,
+            end_frame=final_end_frame,
             stall_start_frame_for_void = self.timer_stall_start_frame,
             timer_start=self.format_timer(self.current_round_timer_start),
             timer_end=self.format_timer(info.timer_value),
