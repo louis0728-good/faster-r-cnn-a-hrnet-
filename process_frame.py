@@ -589,8 +589,11 @@ class RoundDetector:
                 last.end_frame = last.stall_start_frame_for_void
                 last.details.append(f"影片切割點已往前修正至時間停頓點 (幀 {last.stall_start_frame_for_void})")
 
-            if last.filename.startswith("test"):
-                last.filename = "void" + last.filename[len("test"):]
+            #if last.filename.startswith("test"):
+                #last.filename = "void" + last.filename[len("test"):] #
+                # 0627
+                
+            last.filename = f"void{last.round_number:03d}"
             last.details.append(
                 f"假回合修正: 系統判定 {original_after} 但 OCR 觀察分數無變化({ocr_observed}),"
                 f"判定為裁判判無效或燈號誤閃,此回合不應計入有效得分"
@@ -738,7 +741,9 @@ class RoundDetector:
     def create_round_record(self, info: FrameInfo,
                              score_left: int, score_right: int,
                              winner: str, end_type: str) -> RoundRecord:
-        filename = f"test{self.round_count:03d}"
+        #filename = f"test{self.round_count:03d}" # 0627
+        valid_no = sum(1 for r in self.rounds if r.dispute_type != "void") + 1
+        filename = f"test{valid_no:03d}"
 
         # 將終點強制設定為「進入判定/停頓」的那一刻 
         normal_end_types = ["win", "double_win", "passivity", "period_end"]
